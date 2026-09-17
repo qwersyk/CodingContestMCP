@@ -1,0 +1,144 @@
+"""Multi-account HTTP MCP. Website cookies are request-local; game tokens stay in RAM."""
+
+import hashlib
+import logging
+import os
+import re
+from dataclasses import replace
+
+import httpx
+import uvicorn
+from starlette.responses import JSONResponse
+
+from . import game_tools  # noqa: F401 -- registers game tools
+from .client import APIError, CCCClient
+from .context import account_service
+from .service import Service
+from .sessions import AccountSessions
+from .tools import create_mcp, settings
+
+
+class AccountMiddleware:
+    def __init__(self, app, configured, client_factory=CCCClient):
+        self.app = app
+        self.settings = configured
+        self.client_factory = client_factory
+        self.game_sessions = AccountSessions()
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope["path"].rstrip("/") != "/mcp":
+            return await self.app(scope, receive, send)
+        values = [
+            value
+            for key, value in scope.get("headers", [])
+            if key.lower() == b"x-ccc-session"
+        ]
+        # Accept only the cookie value, never a Cookie header or arbitrary headers.
+        if len(values) != 1 or not re.fullmatch(
+            rb"[A-Za-z0-9_+/=%.-]{16,4096}", values[0]
+        ):
+            return await self.reject(
+                scope,
+                receive,
+                send,
+                401,
+                "Supply your CCC SESSION cookie value in X-CCC-Session",
+            )
+
+        client = self.client_factory(
+            replace(self.settings, cookie="", session=values[0].decode("ascii"))
+        )
+        try:
+            try:
+                user = await client.json("GET", "/api/auth/current-user")
+                if (
+                    not isinstance(user, dict)
+                    or not isinstance(user.get("uuid"), str)
+                    or not user["uuid"]
+                ):
+                    return await self.reject(
+                        scope, receive, send, 401, "CCC session is not authenticated"
+                    )
+            except APIError as error:
+                status = (
+                    401
+                    if error.status in (401, 403)
+                    else 429
+                    if error.status == 429
+                    else 503
+                )
+                return await self.reject(
+                    scope,
+                    receive,
+                    send,
+                    status,
+                    "CCC session expired or CCC authentication unavailable",
+                    error.retry_after,
+                )
+            except (httpx.RequestError, ValueError):
+                return await self.reject(
+                    scope,
+                    receive,
+                    send,
+                    503,
+                    "CCC authentication unavailable; try later",
+                )
+
+            # Identity comes exclusively from CCC, not a caller-selected account ID.
+            account = hashlib.sha256(user["uuid"].encode()).hexdigest()
+            client.settings = replace(
+                client.settings, data_dir=self.settings.data_dir / "accounts" / account
+            )
+            try:
+                with self.game_sessions.use(account) as games:
+                    context_token = account_service.set(Service(client, games))
+                    try:
+                        await self.app(scope, receive, send)
+                    finally:
+                        account_service.reset(context_token)
+            except APIError as error:
+                await self.reject(
+                    scope,
+                    receive,
+                    send,
+                    error.status,
+                    str(error.detail),
+                    error.retry_after,
+                )
+        finally:
+            await client.close()
+
+    @staticmethod
+    async def reject(scope, receive, send, status, message, retry_after=None):
+        headers = {"Cache-Control": "no-store"}
+        if retry_after:
+            headers["Retry-After"] = retry_after
+        await JSONResponse(
+            {"error": message, "retry_after": retry_after},
+            status_code=status,
+            headers=headers,
+        )(scope, receive, send)
+
+
+def create_app(configured=None, client_factory=CCCClient):
+    return AccountMiddleware(
+        create_mcp(configured or settings).streamable_http_app(),
+        configured or settings,
+        client_factory,
+    )
+
+
+def main():
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    if os.getenv("MCP_TRANSPORT", "http") not in ("http", "streamable-http"):
+        raise ValueError(
+            "This multi-account server uses Streamable HTTP. Connect with X-CCC-Session."
+        )
+    uvicorn.run(
+        create_app(),
+        host=settings.host,
+        port=settings.port,
+        access_log=False,
+        limit_concurrency=128,
+    )
