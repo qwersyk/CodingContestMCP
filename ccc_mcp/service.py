@@ -1,5 +1,6 @@
 """Contest-scoped workflow with private game tokens and artifact handles."""
 
+import asyncio
 import math
 import time
 from dataclasses import dataclass, field
@@ -209,7 +210,7 @@ class Service:
             response = await self.request(contest, "GET", path, params={"raw": "true"})
             if "json" in response.headers.get("content-type", ""):
                 raise ValueError("Raw asset endpoint returned JSON instead of a file")
-        return self.artifacts.save(response.content, filename)
+        return await asyncio.to_thread(self.artifacts.save, response.content, filename)
 
     async def submit(self, contest, level, file_id, payload, filename):
         if len(payload) > self.client.settings.max_bytes:
@@ -247,7 +248,9 @@ class Service:
                     error.retry_after = str(seconds)
                 raise
             feedback = response.json()
-            seconds = feedback.get("cooldownSec", 0) if isinstance(feedback, dict) else 0
+            seconds = (
+                feedback.get("cooldownSec", 0) if isinstance(feedback, dict) else 0
+            )
             if (
                 isinstance(seconds, (int, float))
                 and math.isfinite(seconds)
