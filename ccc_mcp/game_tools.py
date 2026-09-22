@@ -148,7 +148,8 @@ async def render_pdf_page(artifact_id: str, page: int = 0, dpi: int = 120):
 
 @tool(read_only=False)
 async def upload_artifact(data_base64: str, filename: str = "solution.out"):
-    """Store a base64-encoded file up to CCC_MAX_FILE_BYTES; return its artifact_id."""
+    """Store a base64-encoded file up to CCC_MAX_FILE_BYTES; return its artifact_id.
+    For large local files use python -m ccc_mcp --url <MCP_URL> upload <path> instead of generating base64 in chat."""
 
     def save():
         limit = current_service().client.settings.max_bytes
@@ -180,7 +181,8 @@ async def submit_solution(
     filename: str = "solution.out",
     include_case_details: bool = False,
 ):
-    """Submit exactly one text solution OR artifact. Returns evaluation, score and cooldownSec.
+    """Submit exactly one text solution OR artifact. Use artifact_id for large outputs.
+    Returns evaluation, score and cooldownSec.
     No automatic retries or file-ID guessing. Check evaluation.isCorrect, not only ok."""
 
     async def run():
