@@ -1,4 +1,6 @@
 import base64
+import copy
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,15 +15,67 @@ from ccc_mcp.service import Service
 
 
 class WorkflowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_large_failed_cases_have_bounded_previews_and_full_artifact(self):
+        with tempfile.TemporaryDirectory() as root:
+            client = CCCClient(
+                Settings(data_dir=Path(root)),
+                httpx.MockTransport(lambda _: self.fail("Unexpected request")),
+            )
+            service = Service(client)
+            feedback = {
+                "evaluation": {
+                    "isCorrect": False,
+                    "cases": [{"isCorrect": True}]
+                    + [{"isCorrect": False, "actual": "x" * 50000} for _ in range(25)],
+                },
+                "cooldownSec": 5,
+            }
+            try:
+                with (
+                    patch.object(game_tools, "current_service", return_value=service),
+                    patch.object(
+                        service,
+                        "submit",
+                        new=AsyncMock(
+                            side_effect=lambda *args: copy.deepcopy(feedback)
+                        ),
+                    ),
+                ):
+                    response = await game_tools.submit_solution(
+                        "test", 1, "1", solution="answer"
+                    )
+                    data = response.structuredContent["data"]
+                    self.assertFalse(response.isError)
+                    self.assertLess(len(response.model_dump_json()), 50000)
+                    self.assertEqual(data["cooldownSec"], 5)
+                    evaluation = data["evaluation"]
+                    self.assertEqual(evaluation["case_count"], 26)
+                    self.assertEqual(evaluation["failed_count"], 25)
+                    self.assertEqual(len(evaluation["failed_cases"]), 20)
+                    self.assertEqual(evaluation["failed_cases"][0]["case_index"], 1)
+                    self.assertTrue(evaluation["failed_cases"][0]["truncated"])
+                    saved = service.artifacts.path(data["full_result"]["artifact_id"])
+                    self.assertEqual(json.loads(saved.read_bytes()), feedback)
+                    full = await game_tools.submit_solution(
+                        "test", 1, "1", solution="answer", include_case_details=True
+                    )
+                    self.assertEqual(full.structuredContent["data"], feedback)
+            finally:
+                await client.close()
+
     async def test_unfamiliar_submission_feedback_is_preserved(self):
         with tempfile.TemporaryDirectory() as root:
             feedback = None
 
             def handler(request):
                 if request.url.path == "/api/contests/test":
-                    return httpx.Response(200, json={
-                        "slug": "test", "gameBaseUrl": "https://birds.codingcontest.org"
-                    })
+                    return httpx.Response(
+                        200,
+                        json={
+                            "slug": "test",
+                            "gameBaseUrl": "https://birds.codingcontest.org",
+                        },
+                    )
                 if request.url.path == "/api/game-token":
                     return httpx.Response(200, json={"token": "test-token"})
                 return httpx.Response(200, json=feedback)
@@ -44,7 +98,9 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
                                 "test", 1, "1", solution="answer"
                             )
                             self.assertFalse(response.isError)
-                            self.assertEqual(response.structuredContent["data"], feedback)
+                            self.assertEqual(
+                                response.structuredContent["data"], feedback
+                            )
             finally:
                 await client.close()
 

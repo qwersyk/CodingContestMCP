@@ -148,7 +148,8 @@ async def render_pdf_page(artifact_id: str, page: int = 0, dpi: int = 120):
 
 @tool(read_only=False)
 async def upload_artifact(data_base64: str, filename: str = "solution.out"):
-    """Store a base64-encoded file up to CCC_MAX_FILE_BYTES; return its artifact_id."""
+    """Store a base64-encoded file up to CCC_MAX_FILE_BYTES; return its artifact_id.
+    For large local files use python -m ccc_mcp --url <MCP_URL> upload <path> instead of generating base64 in chat."""
 
     def save():
         limit = current_service().client.settings.max_bytes
@@ -180,7 +181,9 @@ async def submit_solution(
     filename: str = "solution.out",
     include_case_details: bool = False,
 ):
-    """Submit exactly one text solution OR artifact. Returns evaluation, score and cooldownSec.
+    """Submit exactly one text solution OR artifact. Use artifact_id for large outputs.
+    Returns evaluation, score and cooldownSec.
+    Failed-case previews are bounded and use zero-based case_index; full_result preserves the complete report.
     No automatic retries or file-ID guessing. Check evaluation.isCorrect, not only ok."""
 
     async def run():
@@ -189,7 +192,9 @@ async def submit_solution(
         payload = (
             solution.encode("utf-8")
             if solution is not None
-            else current_service().artifacts.path(artifact_id).read_bytes()
+            else await local(
+                lambda: current_service().artifacts.path(artifact_id).read_bytes()
+            )
         )
         feedback = await current_service().submit(
             contest, level, file_id, payload, filename
@@ -203,8 +208,10 @@ async def submit_solution(
             and not include_case_details
         ):
             try:
-                full = current_service().artifacts.save(
-                    json.dumps(feedback).encode(), "submission-result.json"
+                full = await local(
+                    lambda: current_service().artifacts.save(
+                        json.dumps(feedback).encode(), "submission-result.json"
+                    )
                 )
             except (OSError, ValueError):
                 feedback["storage_warning"] = (
@@ -212,11 +219,28 @@ async def submit_solution(
                 )
                 return feedback
             feedback["evaluation"].pop("cases")
-            failed = [case for case in cases if not case.get("isCorrect")]
+            failed_count = 0
+            previews = []
+            for index, case in enumerate(cases):
+                if case.get("isCorrect"):
+                    continue
+                failed_count += 1
+                if len(previews) >= 20:
+                    continue
+                encoded = json.dumps(case, ensure_ascii=False)
+                previews.append(
+                    {**case, "case_index": index}
+                    if len(encoded) <= 1024
+                    else {
+                        "case_index": index,
+                        "truncated": True,
+                        "preview": encoded[:1024],
+                    }
+                )
             feedback["evaluation"].update(
                 case_count=len(cases),
-                failed_count=len(failed),
-                failed_cases=failed[:20],
+                failed_count=failed_count,
+                failed_cases=previews,
             )
             feedback["full_result"] = full
         return feedback
@@ -262,8 +286,10 @@ async def download_certificate(contest_id: int, certificate_type: str):
         response = await current_service().client.request(
             "GET", f"/api/certificates/{contest_id}/{segment(certificate_type)}"
         )
-        return current_service().artifacts.save(
-            response.content, f"{contest_id}-{certificate_type}.pdf"
+        return await local(
+            lambda: current_service().artifacts.save(
+                response.content, f"{contest_id}-{certificate_type}.pdf"
+            )
         )
 
     return await _call(run)
