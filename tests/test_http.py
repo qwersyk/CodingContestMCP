@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import tempfile
 import threading
 import unittest
@@ -79,21 +78,21 @@ class HTTPTests(unittest.TestCase):
                         response.json()["result"]["structuredContent"]["data"]["uuid"],
                         user,
                     )
-                uploaded = call(
-                    "a" * 32,
-                    "upload_artifact",
-                    {"data_base64": base64.b64encode(b"private answer").decode()},
+                uploaded = client.post(
+                    "/mcp/artifacts",
+                    headers={"X-CCC-Session": "a" * 32},
+                    content=b"private answer",
                 )
-                artifact = uploaded.json()["result"]["structuredContent"]["data"][
-                    "artifact_id"
-                ]
+                artifact = uploaded.json()["data"]["artifact_id"]
                 for session, denied in [
                     ("b" * 32, True),
                     ("a" * 32, False),
                     ("c" * 32, False),
                 ]:
-                    read = call(session, "read_artifact", {"artifact_id": artifact})
-                    self.assertEqual(read.json()["result"]["isError"], denied)
+                    read = client.get(
+                        f"/mcp/artifacts/{artifact}", headers={"X-CCC-Session": session}
+                    )
+                    self.assertEqual(read.status_code, 404 if denied else 200)
                 self.assertTrue(all(c.platform.is_closed for c in clients))
                 self.assertEqual(len(list((Path(root) / "accounts").iterdir())), 2)
 

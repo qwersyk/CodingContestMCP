@@ -1,4 +1,3 @@
-import base64
 import copy
 import json
 import tempfile
@@ -12,6 +11,7 @@ from ccc_mcp import game_tools
 from ccc_mcp.client import APIError, CCCClient
 from ccc_mcp.config import Settings
 from ccc_mcp.service import Service
+from ccc_mcp import tools
 
 
 class WorkflowTests(unittest.IsolatedAsyncioTestCase):
@@ -103,7 +103,12 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 ):
                     response = await game_tools.submit_solution(
-                        "test", 1, "1", solution="answer"
+                        "test",
+                        1,
+                        "1",
+                        artifact_id=service.artifacts.save(b"answer", "answer.out")[
+                            "artifact_id"
+                        ],
                     )
                     data = response.structuredContent["data"]
                     self.assertFalse(response.isError)
@@ -117,10 +122,6 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(evaluation["failed_cases"][0]["truncated"])
                     saved = service.artifacts.path(data["full_result"]["artifact_id"])
                     self.assertEqual(json.loads(saved.read_bytes()), feedback)
-                    full = await game_tools.submit_solution(
-                        "test", 1, "1", solution="answer", include_case_details=True
-                    )
-                    self.assertEqual(full.structuredContent["data"], feedback)
             finally:
                 await client.close()
 
@@ -156,7 +157,12 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
                     ):
                         with self.subTest(feedback=feedback):
                             response = await game_tools.submit_solution(
-                                "test", 1, "1", solution="answer"
+                                "test",
+                                1,
+                                "1",
+                                artifact_id=service.artifacts.save(
+                                    b"answer", "answer.out"
+                                )["artifact_id"],
                             )
                             self.assertFalse(response.isError)
                             self.assertEqual(
@@ -165,7 +171,7 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await client.close()
 
-    async def test_large_upload_and_raw_writes_use_request_settings(self):
+    async def test_raw_writes_use_request_settings(self):
         with tempfile.TemporaryDirectory() as root:
             client = CCCClient(
                 Settings(
@@ -181,20 +187,6 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
             service = Service(client)
             try:
                 with patch.object(game_tools, "current_service", return_value=service):
-                    payload = b"x" * (1024 * 1024 + 1)
-                    uploaded = await game_tools.upload_artifact(
-                        base64.b64encode(payload).decode()
-                    )
-                    self.assertFalse(uploaded.isError)
-                    self.assertEqual(
-                        uploaded.structuredContent["data"]["bytes"], len(payload)
-                    )
-                    oversized = await game_tools.upload_artifact(
-                        base64.b64encode(
-                            b"x" * (client.settings.max_bytes + 1)
-                        ).decode()
-                    )
-                    self.assertTrue(oversized.isError)
                     response = await game_tools.ccc_api_request(
                         "POST", "/api/custom", body={"value": 1}
                     )
@@ -213,6 +205,7 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
                 "evaluation": {"isCorrect": True, "cases": [{"isCorrect": True}]},
                 "cooldownSec": 4,
             }
+            artifact_id = service.artifacts.save(b"answer", "answer.out")["artifact_id"]
             try:
                 with (
                     patch.object(game_tools, "current_service", return_value=service),
@@ -224,16 +217,15 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 ):
                     response = await game_tools.submit_solution(
-                        "test", 1, "1-small", solution="answer"
+                        "test", 1, "1-small", artifact_id=artifact_id
                     )
                 submit.assert_awaited_once()
                 self.assertFalse(response.isError)
                 self.assertTrue(
                     response.structuredContent["data"]["evaluation"]["isCorrect"]
                 )
-                self.assertEqual(
-                    response.structuredContent["data"]["evaluation"]["cases"],
-                    [{"isCorrect": True}],
+                self.assertNotIn(
+                    "cases", response.structuredContent["data"]["evaluation"]
                 )
                 self.assertIn("storage_warning", response.structuredContent["data"])
             finally:
@@ -306,7 +298,12 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(submissions, [])
                 with patch.object(game_tools, "current_service", return_value=service):
                     result = await game_tools.submit_solution(
-                        "test", 1, "1-small", solution="42"
+                        "test",
+                        1,
+                        "1-small",
+                        artifact_id=service.artifacts.save(b"42", "answer.out")[
+                            "artifact_id"
+                        ],
                     )
                 self.assertFalse(result.isError)
                 data = result.structuredContent["data"]
@@ -385,5 +382,34 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
                     16,
                 )
                 self.assertEqual(tokens, 1)
+            finally:
+                await client.close()
+
+    async def test_oversized_responses_are_downloadable_and_bounded_even_when_disk_full(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as root:
+            client = CCCClient(Settings(data_dir=Path(root)))
+            service = Service(client)
+            data = {"evaluation": {"isCorrect": False}, "unexpected": "x" * 1000000}
+            try:
+                with patch.object(tools, "current_service", return_value=service):
+                    result = await tools.bounded(data)
+                    self.assertLess(len(json.dumps(result)), 24000)
+                    self.assertFalse(result["preview"]["evaluation"]["isCorrect"])
+                    self.assertEqual(
+                        json.loads(
+                            service.artifacts.path(
+                                result["full_result"]["artifact_id"]
+                            ).read_bytes()
+                        ),
+                        data,
+                    )
+                    with patch.object(
+                        service.artifacts, "save", side_effect=OSError("full")
+                    ):
+                        result = await tools.bounded(data)
+                    self.assertLess(len(json.dumps(result)), 24000)
+                    self.assertIn("storage_warning", result)
             finally:
                 await client.close()

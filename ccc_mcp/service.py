@@ -66,7 +66,11 @@ class Game:
 
 class Service:
     def __init__(
-        self, client: CCCClient, games: GameSessions | None = None, budget=None
+        self,
+        client: CCCClient,
+        games: GameSessions | None = None,
+        budget=None,
+        links=None,
     ):
         self.client = client
         self.artifacts = Artifacts(
@@ -75,6 +79,7 @@ class Service:
             client.settings.public_origin,
             client.settings.artifact_ttl_seconds,
             budget,
+            links,
         )
         self.games = games if games is not None else GameSessions()
 

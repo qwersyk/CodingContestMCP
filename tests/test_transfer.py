@@ -1,5 +1,6 @@
 import hashlib
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -8,6 +9,7 @@ import httpx
 
 from ccc_mcp.__main__ import download_http, upload_http
 from ccc_mcp.app import create_app
+from ccc_mcp.artifacts import Artifacts, TransferLinks
 from ccc_mcp.client import CCCClient
 from ccc_mcp.config import Settings
 
@@ -150,3 +152,63 @@ class TransferTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError):
                 await upload_http(session, "https://example.com/mcp", path, 2)
             session.post.assert_not_called()
+
+    async def test_signed_links_are_scoped_expiring_and_need_no_ccc_credentials(self):
+        with tempfile.TemporaryDirectory() as root:
+            settings = Settings(data_dir=Path(root), max_bytes=100)
+            app = create_app(
+                settings, lambda _: self.fail("Transfer must not contact CCC")
+            )
+            account = "a" * 64
+            artifacts = Artifacts(
+                Path(root) / "accounts" / account,
+                100,
+                budget=app.storage,
+                links=app.links,
+            )
+            first = artifacts.save(b"private", "input.zip")
+            second = artifacts.save(b"other", "other.zip")
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app)
+            ) as http:
+                url = first["download_url"]
+                self.assertEqual((await http.get(url)).content, b"private")
+                self.assertEqual((await http.head(url)).status_code, 200)
+                self.assertEqual(
+                    (await http.post(url, content=b"overwrite")).status_code, 405
+                )
+                for invalid in (
+                    url.replace(first["artifact_id"], second["artifact_id"]),
+                    url.replace(account, "b" * 64),
+                    url[:-1] + ("0" if url[-1] != "0" else "1"),
+                    artifacts.url(first["artifact_id"], int(time.time()) - 1),
+                    url.split("?token=")[0],
+                ):
+                    self.assertEqual((await http.get(invalid)).status_code, 401)
+                upload_url = artifacts.url()
+                self.assertEqual((await http.get(upload_url)).status_code, 405)
+                uploaded = await http.post(upload_url, content=b"answer")
+                self.assertEqual(uploaded.status_code, 200)
+                metadata = uploaded.json()["data"]
+                self.assertEqual(
+                    artifacts.path(metadata["artifact_id"]).read_bytes(), b"answer"
+                )
+                self.assertEqual(
+                    (await http.get(metadata["download_url"])).content, b"answer"
+                )
+                self.assertEqual(
+                    (await http.post(upload_url, content=b"x" * 101)).status_code, 413
+                )
+                self.assertEqual(
+                    (
+                        await http.post(
+                            "http://localhost:8000/mcp?" + url.split("?", 1)[1], json={}
+                        )
+                    ).status_code,
+                    401,
+                )
+                app.links = TransferLinks()
+                self.assertEqual((await http.get(url)).status_code, 401)
+                self.assertEqual(
+                    (await http.post(upload_url, content=b"answer")).status_code, 401
+                )

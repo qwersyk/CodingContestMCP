@@ -14,7 +14,7 @@ from starlette.requests import ClientDisconnect, Request
 from starlette.responses import FileResponse, JSONResponse
 
 from . import game_tools  # noqa: F401 -- registers game tools
-from .artifacts import StorageBudget, StorageFull
+from .artifacts import Artifacts, StorageBudget, StorageFull, TransferLinks
 from .client import APIError, CCCClient
 from .context import account_service
 from .service import Service
@@ -28,6 +28,7 @@ class AccountMiddleware:
         self.settings = configured
         self.client_factory = client_factory
         self.game_sessions = AccountSessions()
+        self.links = TransferLinks()
         self.slots = asyncio.Semaphore(configured.max_concurrent_requests)
         self.storage = StorageBudget(
             configured.data_dir.resolve(), configured.storage_max_bytes
@@ -105,6 +106,23 @@ class AccountMiddleware:
         ].startswith("/mcp/artifacts/")
         if scope["path"].rstrip("/") != "/mcp" and not artifact_route:
             return await self.app(scope, receive, send)
+        if artifact_route and "token" in Request(scope).query_params:
+            resource = scope["path"].removeprefix("/mcp/artifacts").lstrip("/")
+            try:
+                account = self.links.verify(
+                    Request(scope).query_params["token"], resource
+                )
+            except ValueError as error:
+                return await self.reject(scope, receive, send, 401, str(error))
+            artifacts = Artifacts(
+                self.settings.data_dir / "accounts" / account,
+                self.settings.max_bytes,
+                self.settings.public_origin,
+                self.settings.artifact_ttl_seconds,
+                self.storage,
+                self.links,
+            )
+            return await self.transfer(artifacts, scope, receive, send)
         values = [
             value
             for key, value in scope.get("headers", [])
@@ -168,80 +186,11 @@ class AccountMiddleware:
             )
             try:
                 with self.game_sessions.use(account) as games:
-                    service = Service(client, games, self.storage)
+                    service = Service(client, games, self.storage, self.links)
                     if artifact_route:
-                        if scope["path"].rstrip("/") == "/mcp/artifacts":
-                            if scope["method"] != "POST":
-                                return await self.reject(
-                                    scope,
-                                    receive,
-                                    send,
-                                    405,
-                                    "Use POST with a binary body",
-                                )
-                            request = Request(scope, receive)
-                            filename = request.query_params.get(
-                                "filename", "solution.out"
-                            )
-                            if len(filename) > 255 or any(
-                                ord(c) < 32 for c in filename
-                            ):
-                                return await self.reject(
-                                    scope, receive, send, 400, "Invalid filename"
-                                )
-                            try:
-                                length = int(request.headers.get("content-length", "0"))
-                            except ValueError:
-                                return await self.reject(
-                                    scope, receive, send, 400, "Invalid Content-Length"
-                                )
-                            if length < 0 or length > client.settings.max_bytes:
-                                return await self.reject(
-                                    scope,
-                                    receive,
-                                    send,
-                                    413,
-                                    "File exceeds CCC_MAX_FILE_BYTES",
-                                )
-                            try:
-                                data = await service.artifacts.receive(
-                                    request.stream(), filename
-                                )
-                            except ValueError as error:
-                                return await self.reject(
-                                    scope, receive, send, 413, str(error)
-                                )
-                            except ClientDisconnect:
-                                return
-                            except StorageFull as error:
-                                return await self.reject(
-                                    scope, receive, send, 507, str(error)
-                                )
-                            return await JSONResponse(
-                                {"ok": True, "data": data},
-                                headers={"Cache-Control": "no-store"},
-                            )(scope, receive, send)
-                        if scope["method"] not in ("GET", "HEAD"):
-                            return await self.reject(
-                                scope, receive, send, 405, "Use GET or HEAD"
-                            )
-                        try:
-                            path = service.artifacts.path(
-                                scope["path"].removeprefix("/mcp/artifacts/")
-                            )
-                        except ValueError:
-                            return await self.reject(
-                                scope, receive, send, 404, "Artifact not found"
-                            )
-                        return await FileResponse(
-                            path,
-                            media_type="application/octet-stream",
-                            headers={
-                                "Cache-Control": "no-store",
-                                "X-Content-Type-Options": "nosniff",
-                            },
-                            filename=path.name,
-                        )(scope, receive, send)
+                        return await self.transfer(
+                            service.artifacts, scope, receive, send
+                        )
                     context_token = account_service.set(service)
                     try:
                         await self.app(scope, receive, send)
@@ -258,6 +207,63 @@ class AccountMiddleware:
                 )
         finally:
             await client.close()
+
+    async def transfer(self, artifacts, scope, receive, send):
+        if scope["path"].rstrip("/") == "/mcp/artifacts":
+            if scope["method"] != "POST":
+                return await self.reject(
+                    scope,
+                    receive,
+                    send,
+                    405,
+                    "Use POST with a binary body",
+                )
+            request = Request(scope, receive)
+            filename = request.query_params.get("filename", "solution.out")
+            if len(filename) > 255 or any(ord(c) < 32 for c in filename):
+                return await self.reject(scope, receive, send, 400, "Invalid filename")
+            try:
+                length = int(request.headers.get("content-length", "0"))
+            except ValueError:
+                return await self.reject(
+                    scope, receive, send, 400, "Invalid Content-Length"
+                )
+            if length < 0 or length > self.settings.max_bytes:
+                return await self.reject(
+                    scope,
+                    receive,
+                    send,
+                    413,
+                    "File exceeds CCC_MAX_FILE_BYTES",
+                )
+            try:
+                data = await artifacts.receive(request.stream(), filename)
+            except ValueError as error:
+                return await self.reject(scope, receive, send, 413, str(error))
+            except ClientDisconnect:
+                return
+            except StorageFull as error:
+                return await self.reject(scope, receive, send, 507, str(error))
+            return await JSONResponse(
+                {"ok": True, "data": data},
+                headers={"Cache-Control": "no-store"},
+            )(scope, receive, send)
+        if scope["method"] not in ("GET", "HEAD"):
+            return await self.reject(scope, receive, send, 405, "Use GET or HEAD")
+        try:
+            path = artifacts.path(scope["path"].removeprefix("/mcp/artifacts/"))
+        except ValueError:
+            return await self.reject(scope, receive, send, 404, "Artifact not found")
+        return await FileResponse(
+            path,
+            media_type="application/octet-stream",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+                "Referrer-Policy": "no-referrer",
+            },
+            filename=path.name,
+        )(scope, receive, send)
 
     @staticmethod
     async def reject(scope, receive, send, status, message, retry_after=None):

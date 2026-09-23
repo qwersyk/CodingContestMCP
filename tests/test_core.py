@@ -164,13 +164,10 @@ class ArtifactTests(unittest.TestCase):
             with zipfile.ZipFile(buffer, "w") as archive:
                 archive.writestr("../../escape.out", b"hello\x00world")
             stored = artifacts.save(buffer.getvalue(), "test.zip")
-            member = artifacts.member(stored["artifact_id"], "../../escape.out")
             self.assertEqual(
-                artifacts.path(member["artifact_id"]).read_bytes(), b"hello\x00world"
+                artifacts.path(stored["artifact_id"]).read_bytes(), buffer.getvalue()
             )
-            self.assertEqual(
-                artifacts.read(member["artifact_id"], 0, 5)["next_offset"], 5
-            )
+            self.assertEqual(len(list(Path(root).iterdir())), 1)
             with self.assertRaises(ValueError):
                 artifacts.path("../../escape.out")
             (Path(root) / ("f" * 32)).symlink_to("/etc/hosts")

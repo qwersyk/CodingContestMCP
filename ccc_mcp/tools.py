@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import zipfile
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -12,7 +11,6 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
-from pypdf.errors import PdfReadError
 
 from .client import APIError
 from .config import Settings
@@ -33,14 +31,15 @@ def create_mcp(configured: Settings):
         json_response=True,
         instructions="list_challenges -> start_training -> prepare_level(contest, level). "
         "For existing games use active_training or a contest slug/URL directly; no start call is needed. "
-        "prepare_level returns download URLs, transfer instructions, file artifact IDs and exact inputFiles IDs. "
-        "View statements directly with render_pdf_page(pages=[...]); total_pages is in file metadata. "
-        "Solve locally; submit_solution accepts text or artifact_id. Check evaluation.isCorrect and cooldownSec. "
-        "On 429 wait retry_after; never blindly repeat uncertain submissions. "
-        "Large files MUST be transferred by local HTTP commands, not read_artifact loops or base64 tool arguments. "
-        "Use curl with X-CCC-Session from local CCC_SESSION: GET download_url; POST --data-binary @answer.out "
-        "to transfer.upload_url, then submit_solution(artifact_id=...). No repository install needed. "
-        "If the cookie is unavailable in the terminal, ask the user to configure it locally, never paste it in chat.",
+        "prepare_level returns a ZIP download URL, exact inputFiles IDs and an upload URL. "
+        "Transfer ALL files by HTTP using the returned URLs as-is; no cookies or auth headers are needed. "
+        "URLs are temporary bearer secrets: do not share them; request fresh links after expiry or server restart. "
+        "Download and extract the ZIP, view PDFs and run solutions locally. "
+        "POST each output file to upload_url, then submit_solution with its artifact_id. "
+        "Check evaluation.isCorrect and cooldownSec. On 429 wait retry_after. "
+        "Never blindly repeat uncertain submissions; check game_info first. "
+        "Oversized responses provide full_result.download_url for local inspection. "
+        "Never put file contents in tool arguments.",
         transport_security=TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
             allowed_hosts=[
@@ -101,7 +100,7 @@ async def _call(fn):
         return (
             data
             if isinstance(data, CallToolResult)
-            else result({"ok": True, "data": data})
+            else result({"ok": True, "data": await bounded(data)})
         )
     except APIError as error:
         hint = {
@@ -115,7 +114,7 @@ async def _call(fn):
                 "ok": False,
                 "error": {
                     "status": error.status,
-                    "detail": error.detail,
+                    "detail": str(error.detail)[:2000],
                     "retry_after": error.retry_after,
                     "hint": hint,
                 },
@@ -133,14 +132,45 @@ async def _call(fn):
             },
             True,
         )
-    except (ValueError, OSError, KeyError, zipfile.BadZipFile, PdfReadError) as error:
+    except (ValueError, OSError, KeyError) as error:
         return result(
             {
                 "ok": False,
-                "error": {"type": type(error).__name__, "detail": str(error)},
+                "error": {"type": type(error).__name__, "detail": str(error)[:2000]},
             },
             True,
         )
+
+
+async def bounded(data):
+    encoded = json.dumps(data, ensure_ascii=False)
+    if len(encoded) <= 24000:
+        return data
+
+    def preview(value, depth=0):
+        if depth >= 8:
+            return "[truncated]"
+        if isinstance(value, dict):
+            return {k: preview(v, depth + 1) for k, v in list(value.items())[:40]}
+        if isinstance(value, list):
+            return [preview(v, depth + 1) for v in value[:20]]
+        return (
+            value[:1024] + "[truncated]"
+            if isinstance(value, str) and len(value) > 1024
+            else value
+        )
+
+    summary = preview(data)
+    if len(json.dumps(summary, ensure_ascii=False)) > 12000:
+        summary = encoded[:6000]
+    response = {"truncated": True, "preview": summary}
+    try:
+        response["full_result"] = await local(
+            lambda: current_service().artifacts.save(encoded.encode(), "response.json")
+        )
+    except (OSError, ValueError):
+        response["storage_warning"] = "Could not save the full response."
+    return response
 
 
 async def local(fn):
