@@ -56,12 +56,11 @@ async def prepare_level(contest: str, level: int):
             "participant": info["participant"],
             "archive": archive,
             "transfer": {
-                "upload_url": service.artifacts.transfer_url,
-                "auth_header": "X-CCC-Session",
+                "upload_url": service.artifacts.url(),
                 "max_file_bytes": service.client.settings.max_bytes,
                 "retention_seconds": service.client.settings.artifact_ttl_seconds,
-                "download": 'curl --fail --output input.zip --header "X-CCC-Session: $CCC_SESSION" "DOWNLOAD_URL"',
-                "upload": 'curl --fail --header "X-CCC-Session: $CCC_SESSION" --header "Content-Type: application/octet-stream" --request POST --upload-file answer.out "UPLOAD_URL?filename=answer.out"',
+                "download": 'curl --fail --output input.zip "DOWNLOAD_URL"',
+                "upload": 'curl --fail --header "Content-Type: application/octet-stream" --request POST --upload-file answer.out "UPLOAD_URL"',
             },
         }
 

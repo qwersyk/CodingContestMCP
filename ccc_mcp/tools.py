@@ -32,13 +32,14 @@ def create_mcp(configured: Settings):
         instructions="list_challenges -> start_training -> prepare_level(contest, level). "
         "For existing games use active_training or a contest slug/URL directly; no start call is needed. "
         "prepare_level returns a ZIP download URL, exact inputFiles IDs and an upload URL. "
-        "Transfer ALL files by HTTP using local CCC_SESSION in X-CCC-Session. "
+        "Transfer ALL files by HTTP using the returned URLs as-is; no cookies or auth headers are needed. "
+        "URLs are temporary bearer secrets: do not share them; request fresh links after expiry or server restart. "
         "Download and extract the ZIP, view PDFs and run solutions locally. "
         "POST each output file to upload_url, then submit_solution with its artifact_id. "
         "Check evaluation.isCorrect and cooldownSec. On 429 wait retry_after. "
         "Never blindly repeat uncertain submissions; check game_info first. "
         "Oversized responses provide full_result.download_url for local inspection. "
-        "If CCC_SESSION is unavailable locally, ask the user to configure it; never paste cookies in chat.",
+        "Never put file contents in tool arguments.",
         transport_security=TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
             allowed_hosts=[

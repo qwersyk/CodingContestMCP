@@ -97,12 +97,17 @@ class PrepareTests(unittest.TestCase):
             result = response.json()["result"]
             self.assertFalse(result["isError"], result)
             data = result["structuredContent"]["data"]
-            self.assertEqual(
-                data["transfer"]["upload_url"], "http://localhost:8000/mcp/artifacts"
+            self.assertTrue(
+                data["transfer"]["upload_url"].startswith(
+                    "http://localhost:8000/mcp/artifacts?token="
+                )
             )
-            self.assertEqual(
-                data["archive"]["download_url"],
-                "http://localhost:8000/mcp/artifacts/" + data["archive"]["artifact_id"],
+            self.assertTrue(
+                data["archive"]["download_url"].startswith(
+                    "http://localhost:8000/mcp/artifacts/"
+                    + data["archive"]["artifact_id"]
+                    + "?token="
+                )
             )
             self.assertEqual(data["level_info"]["inputFiles"], ["1-small"])
             self.assertNotIn(
@@ -112,9 +117,9 @@ class PrepareTests(unittest.TestCase):
             self.assertEqual(len(list((Path(root) / "accounts").glob("*/*"))), 1)
             artifact = data["archive"]["artifact_id"]
             calls.clear()
-            downloaded = client.get(f"/mcp/artifacts/{artifact}", headers=headers)
+            downloaded = client.get(data["archive"]["download_url"])
             self.assertEqual(downloaded.content, payload.getvalue())
-            self.assertEqual(calls, ["/api/auth/current-user"])
+            self.assertEqual(calls, [])
             self.assertEqual(downloaded.headers["cache-control"], "no-store")
             self.assertEqual(client.get(f"/mcp/artifacts/{artifact}").status_code, 401)
             self.assertEqual(
@@ -134,9 +139,7 @@ class PrepareTests(unittest.TestCase):
                 a if a == b or a + b in ("RS", "SP", "PR") else b for a, b in pairs
             ).encode()
             self.assertEqual(answer, b"P\nR\nS\nR\nS")
-            uploaded = client.post(
-                "/mcp/artifacts?filename=answer.out", headers=headers, content=answer
-            )
+            uploaded = client.post(data["transfer"]["upload_url"], content=answer)
             self.assertEqual(uploaded.status_code, 200)
             submitted = client.post(
                 "/mcp",

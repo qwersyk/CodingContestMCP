@@ -2,7 +2,9 @@
 
 import asyncio
 import hashlib
+import hmac
 import re
+import secrets
 import threading
 import time
 import uuid
@@ -10,6 +12,30 @@ from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import anyio
+
+
+class TransferLinks:
+    def __init__(self):
+        self.key = secrets.token_bytes(32)
+
+    def token(self, account, resource, expires):
+        payload = f"{account}.{expires}"
+        signature = hmac.digest(
+            self.key, f"{payload}:{resource}".encode(), "sha256"
+        ).hex()
+        return f"{payload}.{signature}"
+
+    def verify(self, token, resource):
+        if not re.fullmatch(r"[a-f0-9]{64}\.[0-9]{1,12}\.[a-f0-9]{64}", token):
+            raise ValueError("Invalid transfer link")
+        account, expires, _ = token.split(".")
+        if int(expires) <= time.time() or not hmac.compare_digest(
+            token, self.token(account, resource, expires)
+        ):
+            raise ValueError(
+                "Transfer link expired or invalid; request a new link through MCP"
+            )
+        return account
 
 
 class StorageFull(OSError):
@@ -91,22 +117,32 @@ class Artifacts:
         public_origin: str = "http://localhost:8000",
         ttl_seconds: int = 21600,
         budget: StorageBudget | None = None,
+        links: TransferLinks | None = None,
     ):
         self.root = root.resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.limit = limit
         self.ttl_seconds = ttl_seconds
         self.budget = budget
+        self.links = links
         self.transfer_url = public_origin.rstrip("/") + "/mcp/artifacts"
 
+    def url(self, resource="", expires=None):
+        url = self.transfer_url + (f"/{resource}" if resource else "")
+        if self.links:
+            expires = expires or int(time.time() + self.ttl_seconds)
+            url += "?token=" + self.links.token(self.root.name, resource, expires)
+        return url
+
     def metadata(self, artifact, filename, size, digest):
+        expires = int((self.root / artifact).stat().st_mtime + self.ttl_seconds)
         result = dict(
             artifact_id=artifact,
             filename=filename,
             bytes=size,
             sha256=digest,
-            download_url=f"{self.transfer_url}/{artifact}",
-            expires_at=int((self.root / artifact).stat().st_mtime + self.ttl_seconds),
+            download_url=self.url(artifact, expires),
+            expires_at=expires,
         )
         return result
 
