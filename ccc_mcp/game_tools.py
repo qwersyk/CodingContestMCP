@@ -1,15 +1,12 @@
 """Contest-scoped tools; importing this module registers them."""
 
-import base64
 import json
 from typing import Any, Literal
 from urllib.parse import unquote
 
-from mcp.types import ImageContent
-
 from .context import current_service
-from .service import compact_progress, segment
-from .tools import _call, _params, local, result, tool
+from .service import compact_progress
+from .tools import _call, _params, local, tool
 
 
 @tool(read_only=False)
@@ -38,8 +35,8 @@ async def game_info(contest: str):
 
 @tool(read_only=False)
 async def prepare_level(contest: str, level: int):
-    """Get fresh progress, exact inputFiles IDs, level ZIP and statement artifacts in one call.
-    Small archives are extracted; large inputs stay in the ZIP for local download. Does not start or submit."""
+    """Get a level ZIP download URL, exact inputFiles IDs and HTTP upload instructions.
+    Download, extract, read statements and solve locally. Does not start or submit."""
 
     async def run():
         service = current_service()
@@ -50,7 +47,6 @@ async def prepare_level(contest: str, level: int):
             f"/api/contestant/level/{level}/files",
             f"level-{level}.zip",
         )
-        files = await local(lambda: service.artifacts.unpack(archive["artifact_id"]))
         return {
             "contest": info["contest_slug"],
             "level": level,
@@ -59,14 +55,13 @@ async def prepare_level(contest: str, level: int):
             ),
             "participant": info["participant"],
             "archive": archive,
-            "files": files,
             "transfer": {
                 "upload_url": service.artifacts.transfer_url,
                 "auth_header": "X-CCC-Session",
                 "max_file_bytes": service.client.settings.max_bytes,
                 "retention_seconds": service.client.settings.artifact_ttl_seconds,
-                "download": 'curl --fail --output input.zip --header "X-CCC-Session: $CCC_SESSION" DOWNLOAD_URL',
-                "upload": 'curl --fail --header "X-CCC-Session: $CCC_SESSION" --header "Content-Type: application/octet-stream" --data-binary @answer.out UPLOAD_URL',
+                "download": 'curl --fail --output input.zip --header "X-CCC-Session: $CCC_SESSION" "DOWNLOAD_URL"',
+                "upload": 'curl --fail --header "X-CCC-Session: $CCC_SESSION" --header "Content-Type: application/octet-stream" --request POST --upload-file answer.out "UPLOAD_URL?filename=answer.out"',
             },
         }
 
@@ -74,173 +69,19 @@ async def prepare_level(contest: str, level: int):
 
 
 @tool(read_only=False)
-async def download_level_files(contest: str, level: int):
-    """Download accessible level ZIP to an artifact. Inspect using list_archive/archive_member."""
-
-    async def run():
-        current_service().validate_level(level)
-        return await current_service().asset(
-            contest, f"/api/contestant/level/{level}/files", f"level-{level}.zip"
-        )
-
-    return await _call(run)
-
-
-@tool(read_only=False)
-async def get_level_input(contest: str, level: int, file_id: str):
-    """Download one input to an artifact. Use download_url from a local shell for the complete file."""
-
-    async def run():
-        current_service().validate_level(level, file_id)
-        return await current_service().asset(
-            contest,
-            f"/api/contestant/level/{level}/input/{segment(file_id)}",
-            f"level-{level}-{file_id}.in",
-        )
-
-    return await _call(run)
-
-
-@tool(read_only=False)
-async def get_level_sandbox(contest: str, level: int):
-    """Download optional sandbox HTML as an artifact; the server does not execute it."""
-
-    async def run():
-        current_service().validate_level(level)
-        return await current_service().asset(
-            contest, f"/api/contestant/level/{level}/sandbox", "sandbox.html"
-        )
-
-    return await _call(run)
-
-
-@tool(read_only=True)
-async def read_artifact(
-    artifact_id: str,
-    offset: int = 0,
-    length: int = 8192,
-    encoding: Literal["text", "base64"] = "text",
-):
-    """Preview a small byte range. For large inputs download download_url locally; do not loop over offsets in MCP."""
-    return await _call(
-        lambda: local(
-            lambda: current_service().artifacts.read(
-                artifact_id, offset, length, encoding
-            )
-        )
-    )
-
-
-@tool(read_only=True)
-async def list_archive(artifact_id: str):
-    """List exact filenames and sizes in a ZIP without extracting paths."""
-    return await _call(
-        lambda: local(lambda: current_service().artifacts.archive(artifact_id))
-    )
-
-
-@tool(read_only=False)
-async def archive_member(artifact_id: str, name: str):
-    """Copy one exact ZIP member into its own artifact for reading, PDF extraction or submission."""
-    return await _call(
-        lambda: local(lambda: current_service().artifacts.member(artifact_id, name))
-    )
-
-
-@tool(read_only=True)
-async def read_pdf(artifact_id: str, page: int = 0):
-    """Optional text extraction for known text-only PDFs. For challenge statements use render_pdf_page first;
-    an existing text layer may contain only footers and omit the actual instructions."""
-    return await _call(
-        lambda: local(lambda: current_service().artifacts.pdf_text(artifact_id, page))
-    )
-
-
-@tool(read_only=True)
-async def render_pdf_page(
-    artifact_id: str, page: int = 0, dpi: int = 100, pages: list[int] | None = None
-):
-    """Read challenge statements visually; no text extraction needed. Native images, zero-based pages.
-    Use pages=[0,1,2,3] for up to 6 pages in one call, or page for one page. File metadata includes total_pages."""
-
-    async def run():
-        selected = pages if pages is not None else [page]
-        if not 1 <= len(selected) <= 6:
-            raise ValueError("Request 1..6 pages per call")
-        total = await local(lambda: current_service().artifacts.pdf_pages(artifact_id))
-        if any(p < 0 or p >= total for p in selected):
-            raise ValueError(f"PDF has {total} pages; use page 0..{total - 1}")
-        images, metadata, size = [], [], 0
-        for p in selected:
-            data, info = await local(
-                lambda: current_service().artifacts.pdf_image(artifact_id, p, dpi)
-            )
-            size += len(data)
-            if size > min(current_service().client.settings.max_bytes, 8 * 1024 * 1024):
-                raise ValueError(
-                    "Images exceed response budget; request fewer pages or lower dpi"
-                )
-            metadata.append(info)
-            images.append(
-                ImageContent(
-                    type="image",
-                    mimeType="image/png",
-                    data=base64.b64encode(data).decode(),
-                )
-            )
-        response = result(
-            {
-                "ok": True,
-                "data": metadata[0]
-                if pages is None
-                else {"total_pages": total, "pages": metadata},
-            }
-        )
-        response.content.extend(images)
-        return response
-
-    return await _call(run)
-
-
-@tool(read_only=False)
-async def upload_artifact(data_base64: str, filename: str = "solution.out"):
-    """Store a small base64 file. For large outputs POST raw bytes to prepare_level.transfer.upload_url
-    using curl --data-binary @answer.out and X-CCC-Session; then submit the returned artifact_id."""
-
-    def save():
-        limit = current_service().client.settings.max_bytes
-        if len(data_base64) > 4 * ((limit + 2) // 3):
-            raise ValueError("File exceeds CCC_MAX_FILE_BYTES")
-        return current_service().artifacts.save(
-            base64.b64decode(data_base64, validate=True), filename
-        )
-
-    return await _call(lambda: local(save))
-
-
-@tool(read_only=False)
 async def submit_solution(
     contest: str,
     level: int,
     file_id: str,
-    solution: str | None = None,
-    artifact_id: str | None = None,
+    artifact_id: str,
     filename: str = "solution.out",
-    include_case_details: bool = False,
 ):
-    """Submit exactly one text solution OR artifact. Use artifact_id for large outputs.
-    Returns evaluation, score and cooldownSec.
-    Failed-case previews are bounded and use zero-based case_index; full_result preserves the complete report.
-    No automatic retries or file-ID guessing. Check evaluation.isCorrect, not only ok."""
+    """Submit a file previously uploaded by HTTP using its artifact_id and exact inputFiles ID.
+    Returns evaluation and cooldownSec; check evaluation.isCorrect, not only ok.
+    Never blindly retry an uncertain submission. Full reports are available by HTTP."""
 
     async def run():
-        if (solution is None) == (artifact_id is None):
-            raise ValueError("Supply exactly one of solution or artifact_id")
-        payload = (
-            solution.encode("utf-8")
-            if solution is not None
-            else current_service().artifacts.path(artifact_id)
-        )
+        payload = current_service().artifacts.path(artifact_id)
         feedback = await current_service().submit(
             contest, level, file_id, payload, filename
         )
@@ -250,8 +91,8 @@ async def submit_solution(
             isinstance(cases, list)
             and cases
             and all(isinstance(case, dict) for case in cases)
-            and not include_case_details
         ):
+            full = None
             try:
                 full = await local(
                     lambda: current_service().artifacts.save(
@@ -259,10 +100,7 @@ async def submit_solution(
                     )
                 )
             except (OSError, ValueError):
-                feedback["storage_warning"] = (
-                    "Could not save the report; complete upstream feedback is returned inline."
-                )
-                return feedback
+                feedback["storage_warning"] = "Could not save the full report."
             feedback["evaluation"].pop("cases")
             failed_count = 0
             previews = []
@@ -287,8 +125,9 @@ async def submit_solution(
                 failed_count=failed_count,
                 failed_cases=previews,
             )
-            feedback["full_result"] = full
-        return feedback if include_case_details else compact_progress(feedback)
+            if full:
+                feedback["full_result"] = full
+        return compact_progress(feedback)
 
     return await _call(run)
 
