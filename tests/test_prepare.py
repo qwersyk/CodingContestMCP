@@ -14,6 +14,20 @@ from ccc_mcp.config import Settings
 
 
 class PrepareTests(unittest.TestCase):
+    def test_large_archives_only_extract_statement(self):
+        with tempfile.TemporaryDirectory() as root:
+            artifacts = Artifacts(Path(root), 32 * 1024 * 1024)
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("large.in", b"x" * (17 * 1024 * 1024))
+                archive.writestr("statement.pdf", b"placeholder")
+            saved = artifacts.save(buffer.getvalue(), "level.zip")
+            unpacked = artifacts.unpack(saved["artifact_id"])
+            self.assertFalse(unpacked["extracted"])
+            self.assertEqual(len(unpacked["statements"]), 1)
+            self.assertEqual(unpacked["statements"][0]["filename"], "statement.pdf")
+            self.assertEqual(len(list(Path(root).iterdir())), 2)
+
     def test_preparation_and_binary_transfer_through_http(self):
         payload = io.BytesIO()
         with zipfile.ZipFile(payload, "w") as archive:
@@ -94,6 +108,13 @@ class PrepareTests(unittest.TestCase):
             result = response.json()["result"]
             self.assertFalse(result["isError"], result)
             data = result["structuredContent"]["data"]
+            self.assertEqual(
+                data["transfer"]["upload_url"], "http://localhost:8000/mcp/artifacts"
+            )
+            self.assertEqual(
+                data["archive"]["download_url"],
+                "http://localhost:8000/mcp/artifacts/" + data["archive"]["artifact_id"],
+            )
             self.assertEqual(data["level_info"]["inputFiles"], ["1-small"])
             self.assertNotIn(
                 "submissions", data["participant"]["score"]["state"]["level1"]

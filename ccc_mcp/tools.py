@@ -33,11 +33,14 @@ def create_mcp(configured: Settings):
         json_response=True,
         instructions="list_challenges -> start_training -> prepare_level(contest, level). "
         "For existing games use active_training or a contest slug/URL directly; no start call is needed. "
-        "prepare_level returns file artifact IDs and exact inputFiles IDs. View statements with render_pdf_page. "
+        "prepare_level returns download URLs, transfer instructions, file artifact IDs and exact inputFiles IDs. "
+        "View statements directly with render_pdf_page(pages=[...]); total_pages is in file metadata. "
         "Solve locally; submit_solution accepts text or artifact_id. Check evaluation.isCorrect and cooldownSec. "
         "On 429 wait retry_after; never blindly repeat uncertain submissions. "
-        "Large files: python -m ccc_mcp --url <MCP_URL> download <artifact_id> <path> or upload <path> "
-        "with the repository installed and CCC_SESSION set locally.",
+        "Large files MUST be transferred by local HTTP commands, not read_artifact loops or base64 tool arguments. "
+        "Use curl with X-CCC-Session from local CCC_SESSION: GET download_url; POST --data-binary @answer.out "
+        "to transfer.upload_url, then submit_solution(artifact_id=...). No repository install needed. "
+        "If the cookie is unavailable in the terminal, ask the user to configure it locally, never paste it in chat.",
         transport_security=TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
             allowed_hosts=[

@@ -11,7 +11,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY server.py .
 COPY ccc_mcp ./ccc_mcp
-RUN useradd --uid 10001 --create-home mcp && mkdir -p /data/inbox && chown -R mcp:mcp /data
+RUN useradd --uid 10001 --create-home mcp && mkdir -p /data && chown -R mcp:mcp /data
 USER mcp
 VOLUME ["/data"]
 

@@ -1,9 +1,10 @@
 """Contest-scoped workflow with private game tokens and artifact handles."""
 
-import asyncio
 import math
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
+from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
 
 from .artifacts import Artifacts
@@ -64,9 +65,17 @@ class Game:
 
 
 class Service:
-    def __init__(self, client: CCCClient, games: GameSessions | None = None):
+    def __init__(
+        self, client: CCCClient, games: GameSessions | None = None, budget=None
+    ):
         self.client = client
-        self.artifacts = Artifacts(client.settings.data_dir, client.settings.max_bytes)
+        self.artifacts = Artifacts(
+            client.settings.data_dir,
+            client.settings.max_bytes,
+            client.settings.public_origin,
+            client.settings.artifact_ttl_seconds,
+            budget,
+        )
         self.games = games if games is not None else GameSessions()
 
     async def challenge(self, query: str):
@@ -219,16 +228,21 @@ class Service:
             segment(file_id)
 
     async def asset(self, contest, path, filename):
-        response = await self.request(contest, "GET", path)
-        if "json" in response.headers.get("content-type", ""):
-            # The frontend's documented fallback avoids leaking tokens to signed URLs.
-            response = await self.request(contest, "GET", path, params={"raw": "true"})
-            if "json" in response.headers.get("content-type", ""):
-                raise ValueError("Raw asset endpoint returned JSON instead of a file")
-        return await asyncio.to_thread(self.artifacts.save, response.content, filename)
+        for params in (None, {"raw": "true"}):
+            response = await self.request(
+                contest,
+                "GET",
+                path,
+                params=params,
+                download=lambda chunks: self.artifacts.receive(chunks, filename),
+            )
+            if isinstance(response, dict):
+                return response
+        raise ValueError("Raw asset endpoint returned JSON instead of a file")
 
     async def submit(self, contest, level, file_id, payload, filename):
-        if len(payload) > self.client.settings.max_bytes:
+        size = payload.stat().st_size if isinstance(payload, Path) else len(payload)
+        if size > self.client.settings.max_bytes:
             raise ValueError("Solution exceeds CCC_MAX_FILE_BYTES")
         self.validate_level(level, file_id)
         game = await self.session(contest)
@@ -250,12 +264,19 @@ class Service:
                     str(remaining),
                 )
             try:
-                response = await self.request(
-                    game.slug,
-                    "POST",
-                    f"/api/contestant/submit-{level}-{segment(file_id)}",
-                    files={"solution": (filename, payload, "application/octet-stream")},
-                )
+                with (
+                    payload.open("rb")
+                    if isinstance(payload, Path)
+                    else nullcontext(payload) as content
+                ):
+                    response = await self.request(
+                        game.slug,
+                        "POST",
+                        f"/api/contestant/submit-{level}-{segment(file_id)}",
+                        files={
+                            "solution": (filename, content, "application/octet-stream")
+                        },
+                    )
             except APIError as error:
                 if error.status == 429:
                     seconds = retry_seconds(error)
