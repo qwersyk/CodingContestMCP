@@ -66,7 +66,11 @@ class Game:
 class Service:
     def __init__(self, client: CCCClient, games: GameSessions | None = None):
         self.client = client
-        self.artifacts = Artifacts(client.settings.data_dir, client.settings.max_bytes)
+        self.artifacts = Artifacts(
+            client.settings.data_dir,
+            client.settings.max_bytes,
+            client.settings.public_origin,
+        )
         self.games = games if games is not None else GameSessions()
 
     async def challenge(self, query: str):

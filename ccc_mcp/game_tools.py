@@ -60,6 +60,13 @@ async def prepare_level(contest: str, level: int):
             "participant": info["participant"],
             "archive": archive,
             "files": files,
+            "transfer": {
+                "upload_url": service.artifacts.transfer_url,
+                "auth_header": "X-CCC-Session",
+                "max_file_bytes": service.client.settings.max_bytes,
+                "download": 'curl --fail --output input.zip --header "X-CCC-Session: $CCC_SESSION" DOWNLOAD_URL',
+                "upload": 'curl --fail --header "X-CCC-Session: $CCC_SESSION" --header "Content-Type: application/octet-stream" --data-binary @answer.out UPLOAD_URL',
+            },
         }
 
     return await _call(run)
@@ -80,7 +87,7 @@ async def download_level_files(contest: str, level: int):
 
 @tool(read_only=False)
 async def get_level_input(contest: str, level: int, file_id: str):
-    """Download one input without truncation. Read artifact contents using offsets."""
+    """Download one input to an artifact. Use download_url from a local shell for the complete file."""
 
     async def run():
         current_service().validate_level(level, file_id)
@@ -110,10 +117,10 @@ async def get_level_sandbox(contest: str, level: int):
 async def read_artifact(
     artifact_id: str,
     offset: int = 0,
-    length: int = 65536,
+    length: int = 8192,
     encoding: Literal["text", "base64"] = "text",
 ):
-    """Read a bounded byte range. Follow next_offset until null. Base64 preserves arbitrary bytes."""
+    """Preview a small byte range. For large inputs download download_url locally; do not loop over offsets in MCP."""
     return await _call(
         lambda: local(
             lambda: current_service().artifacts.read(
@@ -141,28 +148,54 @@ async def archive_member(artifact_id: str, name: str):
 
 @tool(read_only=True)
 async def read_pdf(artifact_id: str, page: int = 0):
-    """Extract the existing text layer from a zero-based PDF page; does not run OCR.
-    Use render_pdf_page for diagrams even when text exists, or when needs_ocr is true."""
+    """Optional text extraction for known text-only PDFs. For challenge statements use render_pdf_page first;
+    an existing text layer may contain only footers and omit the actual instructions."""
     return await _call(
         lambda: local(lambda: current_service().artifacts.pdf_text(artifact_id, page))
     )
 
 
 @tool(read_only=True)
-async def render_pdf_page(artifact_id: str, page: int = 0, dpi: int = 120):
-    """Return a PDF page as a native MCP image for visual reading. Zero-based pages.
-    Use for diagrams or when read_pdf returns needs_ocr. Requires an image-capable client/model."""
+async def render_pdf_page(
+    artifact_id: str, page: int = 0, dpi: int = 100, pages: list[int] | None = None
+):
+    """Read challenge statements visually; no text extraction needed. Native images, zero-based pages.
+    Use pages=[0,1,2,3] for up to 6 pages in one call, or page for one page. File metadata includes total_pages."""
 
     async def run():
-        data, metadata = await local(
-            lambda: current_service().artifacts.pdf_image(artifact_id, page, dpi)
-        )
-        response = result({"ok": True, "data": metadata})
-        response.content.append(
-            ImageContent(
-                type="image", mimeType="image/png", data=base64.b64encode(data).decode()
+        selected = pages if pages is not None else [page]
+        if not 1 <= len(selected) <= 6:
+            raise ValueError("Request 1..6 pages per call")
+        total = await local(lambda: current_service().artifacts.pdf_pages(artifact_id))
+        if any(p < 0 or p >= total for p in selected):
+            raise ValueError(f"PDF has {total} pages; use page 0..{total - 1}")
+        images, metadata, size = [], [], 0
+        for p in selected:
+            data, info = await local(
+                lambda: current_service().artifacts.pdf_image(artifact_id, p, dpi)
             )
+            size += len(data)
+            if size > current_service().client.settings.max_bytes:
+                raise ValueError(
+                    "Images exceed CCC_MAX_FILE_BYTES; request fewer pages or lower dpi"
+                )
+            metadata.append(info)
+            images.append(
+                ImageContent(
+                    type="image",
+                    mimeType="image/png",
+                    data=base64.b64encode(data).decode(),
+                )
+            )
+        response = result(
+            {
+                "ok": True,
+                "data": metadata[0]
+                if pages is None
+                else {"total_pages": total, "pages": metadata},
+            }
         )
+        response.content.extend(images)
         return response
 
     return await _call(run)
@@ -170,8 +203,8 @@ async def render_pdf_page(artifact_id: str, page: int = 0, dpi: int = 120):
 
 @tool(read_only=False)
 async def upload_artifact(data_base64: str, filename: str = "solution.out"):
-    """Store a base64-encoded file up to CCC_MAX_FILE_BYTES; return its artifact_id.
-    For large local files use python -m ccc_mcp --url <MCP_URL> upload <path> instead of generating base64 in chat."""
+    """Store a small base64 file. For large outputs POST raw bytes to prepare_level.transfer.upload_url
+    using curl --data-binary @answer.out and X-CCC-Session; then submit the returned artifact_id."""
 
     def save():
         limit = current_service().client.settings.max_bytes
@@ -283,9 +316,7 @@ async def ccc_api_request(
             decoded.split("?")[0].startswith("/api/auth/")
             and decoded.split("?")[0] != "/api/auth/current-user"
         ):
-            raise ValueError(
-                "Raw authentication endpoints are disabled"
-            )
+            raise ValueError("Raw authentication endpoints are disabled")
         response = await current_service().client.request(
             method, path, params=_params(query), json_body=body
         )

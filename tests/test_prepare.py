@@ -94,6 +94,13 @@ class PrepareTests(unittest.TestCase):
             result = response.json()["result"]
             self.assertFalse(result["isError"], result)
             data = result["structuredContent"]["data"]
+            self.assertEqual(
+                data["transfer"]["upload_url"], "http://localhost:8000/mcp/artifacts"
+            )
+            self.assertEqual(
+                data["archive"]["download_url"],
+                "http://localhost:8000/mcp/artifacts/" + data["archive"]["artifact_id"],
+            )
             self.assertEqual(data["level_info"]["inputFiles"], ["1-small"])
             self.assertNotIn(
                 "submissions", data["participant"]["score"]["state"]["level1"]

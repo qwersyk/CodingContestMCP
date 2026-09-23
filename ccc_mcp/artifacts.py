@@ -1,5 +1,6 @@
 """Bounded artifact storage and archive inspection without extracting ZIP paths."""
 
+import asyncio
 import base64
 import hashlib
 import io
@@ -19,11 +20,48 @@ _pdf_lock = threading.Lock()
 
 
 class Artifacts:
-    def __init__(self, root: Path, limit: int):
+    def __init__(
+        self, root: Path, limit: int, public_origin: str = "http://localhost:8000"
+    ):
         self.root = root.resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / "inbox").mkdir(exist_ok=True)
         self.limit = limit
+        self.transfer_url = public_origin.rstrip("/") + "/mcp/artifacts"
+
+    def metadata(self, artifact, filename, size, digest):
+        result = dict(
+            artifact_id=artifact,
+            filename=filename,
+            bytes=size,
+            sha256=digest,
+            download_url=f"{self.transfer_url}/{artifact}",
+        )
+        if filename.lower().endswith(".pdf"):
+            try:
+                result["total_pages"] = self.pdf_pages(artifact)
+            except (ValueError, pdfium.PdfiumError):
+                pass
+        return result
+
+    async def receive(self, chunks, filename):
+        artifact = uuid.uuid4().hex
+        temporary = self.root / (artifact + ".part")
+        digest, size = hashlib.sha256(), 0
+        try:
+            with temporary.open("xb") as stream:
+                async for chunk in chunks:
+                    size += len(chunk)
+                    if size > self.limit:
+                        raise ValueError("File exceeds CCC_MAX_FILE_BYTES")
+                    await asyncio.to_thread(stream.write, chunk)
+                    digest.update(chunk)
+            temporary.replace(self.root / artifact)
+            return await asyncio.to_thread(
+                self.metadata, artifact, filename, size, digest.hexdigest()
+            )
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def import_file(self, relative_path: str):
         """Import a file from the explicitly shared inbox, never arbitrary server paths."""
@@ -49,15 +87,11 @@ class Artifacts:
         path = self.root / artifact
         with path.open("xb") as stream:
             stream.write(data)
-        return dict(
-            artifact_id=artifact,
-            filename=filename,
-            bytes=len(data),
-            sha256=hashlib.sha256(data).hexdigest(),
-            path=str(path),
+        return self.metadata(
+            artifact, filename, len(data), hashlib.sha256(data).hexdigest()
         )
 
-    def read(self, artifact: str, offset=0, length=65536, encoding="text"):
+    def read(self, artifact: str, offset=0, length=8192, encoding="text"):
         if offset < 0 or not 1 <= length <= 262144:
             raise ValueError("offset >= 0 and 1 <= length <= 262144 required")
         path = self.path(artifact)
@@ -75,6 +109,7 @@ class Artifacts:
             bytes=len(data),
             total_bytes=total,
             next_offset=offset + len(data) if offset + len(data) < total else None,
+            download_url=f"{self.transfer_url}/{artifact}",
         )
 
     def archive(self, artifact: str):
@@ -133,7 +168,7 @@ class Artifacts:
             total_pages=len(reader.pages),
             text=text[:100000],
             truncated=len(text) > 100000,
-            needs_ocr=not text.strip(),
+            text_layer_empty=not text.strip(),
         )
 
     def pdf_image(self, artifact: str, page: int = 0, dpi: int = 120):
@@ -142,7 +177,9 @@ class Artifacts:
         try:
             with _pdf_lock, pdfium.PdfDocument(self.path(artifact)) as document:
                 if page >= len(document):
-                    raise ValueError("PDF page out of range")
+                    raise ValueError(
+                        f"PDF has {len(document)} pages; use page 0..{len(document) - 1}"
+                    )
                 with closing(document[page]) as source:
                     width, height = source.get_size()
                     scale = dpi / 72
@@ -166,3 +203,10 @@ class Artifacts:
                 )
         except pdfium.PdfiumError as error:
             raise ValueError("PDF could not be rendered") from error
+
+    def pdf_pages(self, artifact):
+        try:
+            with _pdf_lock, pdfium.PdfDocument(self.path(artifact)) as document:
+                return len(document)
+        except pdfium.PdfiumError as error:
+            raise ValueError("PDF could not be opened") from error

@@ -8,6 +8,7 @@ from dataclasses import replace
 
 import httpx
 import uvicorn
+from starlette.requests import ClientDisconnect, Request
 from starlette.responses import FileResponse, JSONResponse
 
 from . import game_tools  # noqa: F401 -- registers game tools
@@ -28,7 +29,9 @@ class AccountMiddleware:
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
-        artifact_route = scope["path"].startswith("/mcp/artifacts/")
+        artifact_route = scope["path"].rstrip("/") == "/mcp/artifacts" or scope[
+            "path"
+        ].startswith("/mcp/artifacts/")
         if scope["path"].rstrip("/") != "/mcp" and not artifact_route:
             return await self.app(scope, receive, send)
         values = [
@@ -96,6 +99,53 @@ class AccountMiddleware:
                 with self.game_sessions.use(account) as games:
                     service = Service(client, games)
                     if artifact_route:
+                        if scope["path"].rstrip("/") == "/mcp/artifacts":
+                            if scope["method"] != "POST":
+                                return await self.reject(
+                                    scope,
+                                    receive,
+                                    send,
+                                    405,
+                                    "Use POST with a binary body",
+                                )
+                            request = Request(scope, receive)
+                            filename = request.query_params.get(
+                                "filename", "solution.out"
+                            )
+                            if len(filename) > 255 or any(
+                                ord(c) < 32 for c in filename
+                            ):
+                                return await self.reject(
+                                    scope, receive, send, 400, "Invalid filename"
+                                )
+                            try:
+                                length = int(request.headers.get("content-length", "0"))
+                            except ValueError:
+                                return await self.reject(
+                                    scope, receive, send, 400, "Invalid Content-Length"
+                                )
+                            if length < 0 or length > client.settings.max_bytes:
+                                return await self.reject(
+                                    scope,
+                                    receive,
+                                    send,
+                                    413,
+                                    "File exceeds CCC_MAX_FILE_BYTES",
+                                )
+                            try:
+                                data = await service.artifacts.receive(
+                                    request.stream(), filename
+                                )
+                            except ValueError as error:
+                                return await self.reject(
+                                    scope, receive, send, 413, str(error)
+                                )
+                            except ClientDisconnect:
+                                return
+                            return await JSONResponse(
+                                {"ok": True, "data": data},
+                                headers={"Cache-Control": "no-store"},
+                            )(scope, receive, send)
                         if scope["method"] not in ("GET", "HEAD"):
                             return await self.reject(
                                 scope, receive, send, 405, "Use GET or HEAD"

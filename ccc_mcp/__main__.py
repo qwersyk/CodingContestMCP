@@ -1,8 +1,7 @@
-"""Transfer local files through the existing MCP tools without printing their contents."""
+"""Stream files over HTTP without putting their contents in MCP messages."""
 
 import argparse
 import asyncio
-import base64
 import getpass
 import hashlib
 import json
@@ -14,30 +13,29 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import httpx
-from mcp import ClientSession
-from mcp.client.streamable_http import streamable_http_client
-from mcp.shared.exceptions import McpError
 
 
-async def call(session, name, **arguments):
-    response = await session.call_tool(name, arguments)
-    body = response.structuredContent
-    if response.isError or not isinstance(body, dict) or body.get("ok") is not True:
-        raise ValueError(json.dumps(body or {"error": "MCP tool failed"}))
-    return body["data"]
-
-
-async def upload(session, path: Path, limit: int):
+async def upload_http(http, url, path: Path, limit: int):
     with path.open("rb") as source:
-        payload = source.read(limit + 1)
-    if len(payload) > limit:
-        raise ValueError("File exceeds --max-bytes")
-    return await call(
-        session,
-        "upload_artifact",
-        data_base64=base64.b64encode(payload).decode(),
-        filename=path.name,
-    )
+        if os.fstat(source.fileno()).st_size > limit:
+            raise ValueError("File exceeds --max-bytes")
+
+        async def chunks():
+            size = 0
+            while chunk := await asyncio.to_thread(source.read, 262144):
+                size += len(chunk)
+                if size > limit:
+                    raise ValueError("File exceeds --max-bytes")
+                yield chunk
+
+        response = await http.post(
+            f"{url.rstrip('/')}/artifacts",
+            params={"filename": path.name},
+            content=chunks(),
+            headers={"Content-Type": "application/octet-stream"},
+        )
+    response.raise_for_status()
+    return response.json()["data"]
 
 
 async def transfer(args, cookie):
@@ -50,7 +48,7 @@ async def transfer(args, cookie):
             return await download_http(
                 http, args.url, args.artifact_id, args.path, args.max_bytes
             )
-        return await upload_mcp(http, args)
+        return await upload_http(http, args.url, args.path, args.max_bytes)
 
 
 async def download_http(http, url, artifact, path, limit):
@@ -75,15 +73,6 @@ async def download_http(http, url, artifact, path, limit):
             target.flush()
             os.link(target.name, path)
     return {"path": str(path), "bytes": size, "sha256": digest.hexdigest()}
-
-
-async def upload_mcp(http, args):
-    async with (
-        streamable_http_client(args.url, http_client=http) as (read, write, _),
-        ClientSession(read, write) as session,
-    ):
-        await session.initialize()
-        return await upload(session, args.path, args.max_bytes)
 
 
 def main():
@@ -128,7 +117,7 @@ def main():
         parser.error("Supply only the SESSION cookie value, without SESSION=")
     try:
         print(json.dumps(asyncio.run(transfer(args, cookie))))
-    except (ValueError, OSError, httpx.HTTPError, McpError, ExceptionGroup) as error:
+    except (ValueError, OSError, httpx.HTTPError, ExceptionGroup) as error:
         while isinstance(error, BaseExceptionGroup) and error.exceptions:
             error = error.exceptions[0]
         print(
