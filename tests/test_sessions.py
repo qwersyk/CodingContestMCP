@@ -153,8 +153,12 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
                                 "id": 1,
                                 "method": "tools/call",
                                 "params": {
-                                    "name": "participant_state",
-                                    "arguments": {"contest": "test"},
+                                    "name": "game_api_request",
+                                    "arguments": {
+                                        "contest": "test",
+                                        "method": "GET",
+                                        "path": "/api/game-engine/participant/state",
+                                    },
                                 },
                             },
                         )

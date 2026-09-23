@@ -8,7 +8,7 @@ from dataclasses import replace
 
 import httpx
 import uvicorn
-from starlette.responses import JSONResponse
+from starlette.responses import FileResponse, JSONResponse
 
 from . import game_tools  # noqa: F401 -- registers game tools
 from .client import APIError, CCCClient
@@ -26,7 +26,10 @@ class AccountMiddleware:
         self.game_sessions = AccountSessions()
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or scope["path"].rstrip("/") != "/mcp":
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        artifact_route = scope["path"].startswith("/mcp/artifacts/")
+        if scope["path"].rstrip("/") != "/mcp" and not artifact_route:
             return await self.app(scope, receive, send)
         values = [
             value
@@ -91,7 +94,30 @@ class AccountMiddleware:
             )
             try:
                 with self.game_sessions.use(account) as games:
-                    context_token = account_service.set(Service(client, games))
+                    service = Service(client, games)
+                    if artifact_route:
+                        if scope["method"] not in ("GET", "HEAD"):
+                            return await self.reject(
+                                scope, receive, send, 405, "Use GET or HEAD"
+                            )
+                        try:
+                            path = service.artifacts.path(
+                                scope["path"].removeprefix("/mcp/artifacts/")
+                            )
+                        except ValueError:
+                            return await self.reject(
+                                scope, receive, send, 404, "Artifact not found"
+                            )
+                        return await FileResponse(
+                            path,
+                            media_type="application/octet-stream",
+                            headers={
+                                "Cache-Control": "no-store",
+                                "X-Content-Type-Options": "nosniff",
+                            },
+                            filename=path.name,
+                        )(scope, receive, send)
+                    context_token = account_service.set(service)
                     try:
                         await self.app(scope, receive, send)
                     finally:

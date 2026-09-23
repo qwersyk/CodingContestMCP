@@ -105,6 +105,22 @@ class Artifacts:
                 payload = stream.read(self.limit + 1)
             return self.save(payload, name)
 
+    def unpack(self, artifact: str):
+        entries = self.archive(artifact)
+        files = [entry for entry in entries if not entry["directory"]]
+        if len(files) > 100 or sum(entry["bytes"] for entry in files) > self.limit:
+            return {
+                "extracted": False,
+                "entries": entries,
+                "hint": "Use archive_member or download the ZIP locally; automatic extraction limit exceeded",
+            }
+        if len({entry["name"] for entry in files}) != len(files):
+            raise ValueError("ZIP contains duplicate filenames")
+        return {
+            "extracted": True,
+            "entries": [self.member(artifact, entry["name"]) for entry in files],
+        }
+
     def pdf_text(self, artifact: str, page: int = 0):
         if page < 0:
             raise ValueError("page must be nonnegative")

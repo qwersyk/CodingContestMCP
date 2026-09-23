@@ -6,7 +6,7 @@ import asyncio
 import json
 import zipfile
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import urlsplit
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -31,19 +31,13 @@ def create_mcp(configured: Settings):
         port=configured.port,
         stateless_http=True,
         json_response=True,
-        instructions="Each connection uses its own CCC account. list_challenges -> start_training(query, mode) -> "
-        "start_game(contest=training.contestName) -> game_info -> download_level_files. "
-        "Use list_archive/archive_member/read_pdf to inspect statements; render_pdf_page displays diagrams and image-only pages. "
-        "submit_solution accepts text or artifact_id. Keep contest slug; tokens stay private. "
-        "Run solvers locally in any language. With this repository installed, transfer large files using "
-        "python -m ccc_mcp --url <MCP_URL> upload <path> or download <artifact_id> <path>; "
-        "the local client reads CCC_SESSION or prompts privately. Upload returns artifact_id; it does not submit. "
-        "Check evaluation.isCorrect, score and cooldownSec. Never blindly retry an uncertain submission. "
-        "Read game_info first. Use exact inputFiles IDs. Registrations and invitations change the account. "
-        "For an existing training or competition call start_game with its slug or contest URL; "
-        "do not call start_training to resume. Check active_training/my_registrations to find existing games. "
-        "Competition entry needs no training mode. Share resume.contest to hand off to another agent. "
-        "On 429 wait retry_after seconds; concurrent calls share the token cooldown.",
+        instructions="list_challenges -> start_training -> prepare_level(contest, level). "
+        "For existing games use active_training or a contest slug/URL directly; no start call is needed. "
+        "prepare_level returns file artifact IDs and exact inputFiles IDs. View statements with render_pdf_page. "
+        "Solve locally; submit_solution accepts text or artifact_id. Check evaluation.isCorrect and cooldownSec. "
+        "On 429 wait retry_after; never blindly repeat uncertain submissions. "
+        "Large files: python -m ccc_mcp --url <MCP_URL> download <artifact_id> <path> or upload <path> "
+        "with the repository installed and CCC_SESSION set locally.",
         transport_security=TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
             allowed_hosts=[
@@ -72,21 +66,8 @@ def tool(read_only=None):
         read = (
             read_only
             if read_only is not None
-            else fn.__name__.startswith(
-                (
-                    "get_",
-                    "list_",
-                    "my_",
-                    "auth_",
-                    "check_",
-                    "hall_",
-                    "team_invitations",
-                    "active_",
-                )
-            )
+            else fn.__name__.startswith(("get_", "list_", "my_", "auth_", "active_"))
         )
-        if fn.__name__ == "get_or_create_private_team":
-            read = False
         annotations = ToolAnnotations(
             readOnlyHint=read,
             destructiveHint=not read,
@@ -173,47 +154,6 @@ async def auth_status() -> CallToolResult:
 
 
 @tool()
-async def update_profile(profile: dict[str, Any]) -> CallToolResult:
-    """Update the signed-in user's profile fields accepted by CCC."""
-
-    if not profile:
-        return result(
-            {
-                "ok": False,
-                "error": {"type": "validation", "detail": "profile cannot be empty"},
-            },
-            True,
-        )
-    return await _call(
-        lambda: current_service().client.json(
-            "PUT", "/api/auth/current-user", json_body=profile
-        )
-    )
-
-
-@tool()
-async def check_username_availability(username: str) -> CallToolResult:
-    """Check whether a username is available without changing the account."""
-
-    return await _call(
-        lambda: current_service().client.json(
-            "GET", "/api/auth/check-username", params={"username": username}
-        )
-    )
-
-
-@tool()
-async def check_email_availability(email: str) -> CallToolResult:
-    """Check whether an email is available without changing the account."""
-
-    return await _call(
-        lambda: current_service().client.json(
-            "GET", "/api/auth/check-email", params={"email": email}
-        )
-    )
-
-
-@tool()
 async def accept_participant_role() -> CallToolResult:
     """Enable the Participant role required to start training and join contests."""
 
@@ -229,15 +169,6 @@ async def list_challenges() -> CallToolResult:
     """List all public training games. Each item includes its slug, name, description and level count."""
 
     return await _call(lambda: current_service().client.json("GET", "/api/games"))
-
-
-@tool()
-async def get_challenge(slug: str) -> CallToolResult:
-    """Get a challenge definition and progress metadata by its game slug."""
-
-    return await _call(
-        lambda: current_service().client.json("GET", f"/api/training/{segment(slug)}")
-    )
 
 
 @tool()
@@ -282,306 +213,9 @@ async def get_contest(contest: str) -> CallToolResult:
 
 
 @tool()
-async def get_active_edition() -> CallToolResult:
-    """Return the currently active contest edition, if one exists."""
-
-    return await _call(
-        lambda: current_service().client.json("GET", "/api/editions/active")
-    )
-
-
-@tool()
-async def list_venues(query: dict[str, Any] | None = None) -> CallToolResult:
-    """Search contest venues; query accepts the same filters as the website's /api/venues endpoint."""
-
-    return await _call(
-        lambda: current_service().client.json(
-            "GET", "/api/venues", params=_params(query)
-        )
-    )
-
-
-@tool()
-async def discover_venues(contest_ids: list[int]) -> CallToolResult:
-    """Return venue availability for several contest ids."""
-
-    if not contest_ids:
-        return result(
-            {
-                "ok": False,
-                "error": {
-                    "type": "validation",
-                    "detail": "contest_ids cannot be empty",
-                },
-            },
-            True,
-        )
-    return await _call(
-        lambda: current_service().client.json(
-            "GET",
-            "/api/venues/discovery",
-            params={"contestIds": [str(x) for x in contest_ids]},
-        )
-    )
-
-
-@tool()
 async def my_registrations() -> CallToolResult:
     """List the current user's contest registrations and team/venue choices."""
 
     return await _call(
         lambda: current_service().client.json("GET", "/api/contests/my-registrations")
-    )
-
-
-@tool()
-async def register_for_contest(
-    contest: str, team_id: int | None = None, venue_id: int | None = None
-) -> CallToolResult:
-    """Register for a contest. A team_id and/or venue_id can be supplied when the contest requires them."""
-
-    body = _params({"teamId": team_id, "venueId": venue_id})
-    return await _call(
-        lambda: current_service().client.json(
-            "POST", f"/api/contests/{segment(contest)}/register", json_body=body
-        )
-    )
-
-
-@tool()
-async def register_for_contests(
-    contests: list[str], team_id: int | None = None, venue_id: int | None = None
-) -> CallToolResult:
-    """Register for several contests in one request."""
-
-    if not contests:
-        return result(
-            {
-                "ok": False,
-                "error": {"type": "validation", "detail": "contests cannot be empty"},
-            },
-            True,
-        )
-    body = {
-        "contestNames": contests,
-        **_params({"teamId": team_id, "venueId": venue_id}),
-    }
-    return await _call(
-        lambda: current_service().client.json(
-            "POST", "/api/contests/registrations", json_body=body
-        )
-    )
-
-
-@tool()
-async def unregister_from_contest(contest: str) -> CallToolResult:
-    """Remove the current user's registration from a contest."""
-
-    return await _call(
-        lambda: current_service().client.json(
-            "DELETE", f"/api/contests/{segment(contest)}/register"
-        )
-    )
-
-
-@tool()
-async def change_registration_venue(contest: str, venue_id: int) -> CallToolResult:
-    """Change the venue for an existing registration."""
-
-    return await _call(
-        lambda: current_service().client.json(
-            "PUT",
-            f"/api/contests/{segment(contest)}/register",
-            json_body={"venueId": venue_id},
-        )
-    )
-
-
-@tool()
-async def my_results(page: int = 0, size: int = 20) -> CallToolResult:
-    """List the current user's contest results."""
-
-    return await _call(
-        lambda: current_service().client.json(
-            "GET", "/api/contests/my-results", params={"page": page, "size": size}
-        )
-    )
-
-
-@tool()
-async def my_scores() -> CallToolResult:
-    """List training and contest scores visible to the current user."""
-
-    return await _call(
-        lambda: current_service().client.json("GET", "/api/contests/my-scores")
-    )
-
-
-@tool()
-async def my_certificates() -> CallToolResult:
-    """List certificates earned by the current user."""
-
-    return await _call(
-        lambda: current_service().client.json("GET", "/api/certificates")
-    )
-
-
-@tool()
-async def hall_of_fame_summary(edition: str | None = None) -> CallToolResult:
-    """Return the latest or a selected edition's public Hall of Fame summary."""
-
-    path = (
-        "/api/hall-of-fame/editions/latest/summary"
-        if edition is None
-        else f"/api/hall-of-fame/editions/{quote(edition, safe='')}/summary"
-    )
-    return await _call(lambda: current_service().client.json("GET", path))
-
-
-@tool()
-async def hall_of_fame_leaderboard(
-    contest: str,
-    page: int = 0,
-    size: int = 100,
-    search: str | None = None,
-    country: str | None = None,
-    venue_id: int | None = None,
-) -> CallToolResult:
-    """Read a public contest leaderboard with optional search, country and venue filters."""
-
-    query = _params(
-        {
-            "page": page,
-            "size": size,
-            "search": search,
-            "country": country,
-            "venueId": venue_id,
-        }
-    )
-    return await _call(
-        lambda: current_service().client.json(
-            "GET",
-            f"/api/hall-of-fame/contests/{segment(contest)}/leaderboard",
-            params=query,
-        )
-    )
-
-
-@tool()
-async def create_team(name: str) -> CallToolResult:
-    """Create a team with the supplied name."""
-
-    body = {"name": name}
-    return await _call(
-        lambda: current_service().client.json("POST", "/api/teams", json_body=body)
-    )
-
-
-@tool()
-async def get_or_create_private_team() -> CallToolResult:
-    """Get the user's private solo team, creating it when necessary."""
-
-    return await _call(
-        lambda: current_service().client.json(
-            "POST", "/api/teams/private", json_body=None
-        )
-    )
-
-
-@tool()
-async def get_team(team_id: int) -> CallToolResult:
-    """Get a team and its members."""
-
-    return await _call(
-        lambda: current_service().client.json("GET", f"/api/teams/{team_id}")
-    )
-
-
-@tool()
-async def invite_team_member(team_id: int, email: str) -> CallToolResult:
-    """Invite a member to a team by email."""
-
-    return await _call(
-        lambda: current_service().client.json(
-            "POST", f"/api/teams/{team_id}/invite", json_body={"email": email}
-        )
-    )
-
-
-@tool()
-async def rename_team(team_id: int, name: str) -> CallToolResult:
-    """Rename a team."""
-
-    return await _call(
-        lambda: current_service().client.json(
-            "PUT", f"/api/teams/{team_id}/name", json_body={"name": name}
-        )
-    )
-
-
-@tool()
-async def leave_team(team_id: int) -> CallToolResult:
-    """Leave a team."""
-
-    return await _call(
-        lambda: current_service().client.json(
-            "POST", f"/api/teams/{team_id}/leave", json_body=None
-        )
-    )
-
-
-@tool()
-async def transfer_team_ownership(team_id: int, user_id: int) -> CallToolResult:
-    """Transfer team ownership to another member."""
-
-    return await _call(
-        lambda: current_service().client.json(
-            "PUT", f"/api/teams/{team_id}/owner", json_body={"userId": user_id}
-        )
-    )
-
-
-@tool()
-async def remove_team_member(team_id: int, user_id: int) -> CallToolResult:
-    """Remove a member from a team."""
-
-    return await _call(
-        lambda: current_service().client.json(
-            "DELETE", f"/api/teams/{team_id}/members/{user_id}"
-        )
-    )
-
-
-@tool()
-async def team_invitations(team_id: int) -> CallToolResult:
-    """List pending invitations for a team."""
-
-    return await _call(
-        lambda: current_service().client.json(
-            "GET", f"/api/teams/{team_id}/invitations"
-        )
-    )
-
-
-@tool()
-async def get_team_invitation(token: str) -> CallToolResult:
-    """Inspect a team invitation token."""
-
-    return await _call(
-        lambda: current_service().client.json(
-            "GET", f"/api/teams/invitations/{quote(token, safe='')}"
-        )
-    )
-
-
-@tool()
-async def accept_team_invitation(token: str) -> CallToolResult:
-    """Accept a team invitation token."""
-
-    return await _call(
-        lambda: current_service().client.json(
-            "POST",
-            f"/api/teams/invitations/{quote(token, safe='')}/accept",
-            json_body=None,
-        )
     )

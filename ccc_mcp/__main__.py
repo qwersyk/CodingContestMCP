@@ -40,60 +40,50 @@ async def upload(session, path: Path, limit: int):
     )
 
 
-async def download(session, artifact: str, path: Path, limit: int):
+async def transfer(args, cookie):
+    async with httpx.AsyncClient(
+        headers={"X-CCC-Session": cookie},
+        timeout=60,
+        follow_redirects=False,
+    ) as http:
+        if args.command == "download":
+            return await download_http(
+                http, args.url, args.artifact_id, args.path, args.max_bytes
+            )
+        return await upload_mcp(http, args)
+
+
+async def download_http(http, url, artifact, path, limit):
+    if not re.fullmatch(r"[a-f0-9]{32}", artifact):
+        raise ValueError("Invalid artifact_id")
     if path.exists() or path.is_symlink():
         raise ValueError("Destination already exists; choose a new path")
-    digest = hashlib.sha256()
-    offset, total = 0, None
-    with tempfile.NamedTemporaryFile(dir=path.parent) as target:
-        while True:
-            part = await call(
-                session,
-                "read_artifact",
-                artifact_id=artifact,
-                offset=offset,
-                length=262144,
-                encoding="base64",
-            )
-            chunk = base64.b64decode(part["data"], validate=True)
-            if total is None:
-                total = part["total_bytes"]
-            end = offset + len(chunk)
-            if (
-                not isinstance(total, int)
-                or not 0 <= total <= limit
-                or part["total_bytes"] != total
-                or part["offset"] != offset
-                or part["bytes"] != len(chunk)
-                or end > total
-                or part["next_offset"] != (end if end < total else None)
-                or (not chunk and end < total)
-            ):
-                raise ValueError("Invalid artifact range or file exceeds --max-bytes")
-            target.write(chunk)
-            digest.update(chunk)
-            offset = end
-            if offset == total:
-                break
-        target.flush()
-        os.link(target.name, path)
-    return {"path": str(path), "bytes": offset, "sha256": digest.hexdigest()}
+    digest, size = hashlib.sha256(), 0
+    async with http.stream(
+        "GET", f"{url.rstrip('/')}/artifacts/{artifact}"
+    ) as response:
+        response.raise_for_status()
+        if int(response.headers.get("content-length", "0")) > limit:
+            raise ValueError("File exceeds --max-bytes")
+        with tempfile.NamedTemporaryFile(dir=path.parent) as target:
+            async for chunk in response.aiter_bytes(262144):
+                size += len(chunk)
+                if size > limit:
+                    raise ValueError("File exceeds --max-bytes")
+                target.write(chunk)
+                digest.update(chunk)
+            target.flush()
+            os.link(target.name, path)
+    return {"path": str(path), "bytes": size, "sha256": digest.hexdigest()}
 
 
-async def transfer(args, cookie):
+async def upload_mcp(http, args):
     async with (
-        httpx.AsyncClient(
-            headers={"X-CCC-Session": cookie},
-            timeout=60,
-            follow_redirects=False,
-        ) as http,
         streamable_http_client(args.url, http_client=http) as (read, write, _),
         ClientSession(read, write) as session,
     ):
         await session.initialize()
-        if args.command == "upload":
-            return await upload(session, args.path, args.max_bytes)
-        return await download(session, args.artifact_id, args.path, args.max_bytes)
+        return await upload(session, args.path, args.max_bytes)
 
 
 def main():
