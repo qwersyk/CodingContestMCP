@@ -90,16 +90,24 @@ class CCCClient:
         await self.platform.aclose()
         await self.games.aclose()
 
-    async def _send(self, http, method, url, **kwargs):
+    async def _send(self, http, method, url, *, download=None, **kwargs):
         async with http.stream(method, url, **kwargs) as response:
-            return await self._consume(response)
+            return await self._consume(response, download)
 
-    async def _consume(self, response):
+    async def _consume(self, response, download=None):
+        if (
+            download is not None
+            and response.is_success
+            and "json" not in response.headers.get("content-type", "")
+        ):
+            return await download(response.aiter_bytes(262144))
         payload = bytearray()
         async for chunk in response.aiter_bytes():
             payload.extend(chunk)
-            if len(payload) > self.settings.max_bytes:
-                raise ValueError("Upstream response exceeds CCC_MAX_FILE_BYTES")
+            if len(payload) > min(self.settings.max_bytes, 16 * 1024 * 1024):
+                raise ValueError(
+                    "Upstream JSON/buffered response exceeds memory limit; use file transfer for large data. If this was a submission, inspect game_info before retrying."
+                )
         # aiter_bytes already decodes HTTP compression. Do not decode it twice.
         headers = dict(response.headers)
         headers.pop("content-encoding", None)
@@ -131,6 +139,7 @@ class CCCClient:
         params=None,
         json_body=None,
         files=None,
+        download=None,
     ):
         method = method.upper()
         if method not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
@@ -158,7 +167,7 @@ class CCCClient:
             request.headers.pop("cookie", None)
             response = await self.games.send(request, stream=True)
             try:
-                return await self._consume(response)
+                return await self._consume(response, download)
             finally:
                 await response.aclose()
         # Serialize cookie rotation and CSRF bootstrap, including mutations.
@@ -169,7 +178,12 @@ class CCCClient:
             if method != "GET" and self._xsrf():
                 headers["X-XSRF-TOKEN"] = unquote(self._xsrf())
             return await self._send(
-                self.platform, method, PLATFORM + path, headers=headers, **kwargs
+                self.platform,
+                method,
+                PLATFORM + path,
+                headers=headers,
+                download=download,
+                **kwargs,
             )
 
     def _xsrf(self):

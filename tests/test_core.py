@@ -1,6 +1,8 @@
 import gzip
 import io
+import os
 import tempfile
+import time
 import unittest
 import zipfile
 from pathlib import Path
@@ -155,7 +157,7 @@ class ArtifactTests(unittest.TestCase):
                 api_path(value)
         self.assertEqual(api_path("/api/test?raw=true"), "/api/test?raw=true")
 
-    def test_archive_and_shared_import(self):
+    def test_archive_paths_are_opaque(self):
         with tempfile.TemporaryDirectory() as root:
             artifacts = Artifacts(Path(root), 10000)
             buffer = io.BytesIO()
@@ -171,13 +173,37 @@ class ArtifactTests(unittest.TestCase):
             )
             with self.assertRaises(ValueError):
                 artifacts.path("../../escape.out")
-            inbox = Path(root) / "inbox"
-            inbox.mkdir(exist_ok=True)
-            (inbox / "answer.out").write_bytes(b"42")
-            self.assertEqual(artifacts.import_file("answer.out")["bytes"], 2)
-            (inbox / "link").symlink_to("/etc/hosts")
+            (Path(root) / ("f" * 32)).symlink_to("/etc/hosts")
             with self.assertRaises(ValueError):
-                artifacts.import_file("link")
+                artifacts.path("f" * 32)
+
+    def test_expiration_cleanup_only_removes_owned_artifacts(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            account = root / "accounts" / ("a" * 64)
+            artifacts = Artifacts(account, 1000, ttl_seconds=60)
+            old = artifacts.save(b"old", "old.out")
+            fresh = artifacts.save(b"new", "new.out")
+            stale = time.time() - 120
+            os.utime(account / old["artifact_id"], (stale, stale))
+            partial = account / ("c" * 32 + ".part")
+            partial.touch()
+            os.utime(partial, (stale, stale))
+            unrelated = account / "notes.txt"
+            unrelated.write_text("keep")
+            os.utime(unrelated, (stale, stale))
+            external = root / "external"
+            external.write_text("keep")
+            os.utime(external, (stale, stale))
+            (account / ("d" * 32)).symlink_to(external)
+            with self.assertRaisesRegex(ValueError, "expired"):
+                artifacts.path(old["artifact_id"])
+            self.assertEqual(Artifacts.cleanup(root, 60), 2)
+            self.assertTrue(artifacts.path(fresh["artifact_id"]).exists())
+            self.assertTrue(unrelated.exists())
+            self.assertTrue(external.exists())
+            self.assertFalse(partial.exists())
+            self.assertEqual(Artifacts.cleanup(root, 60), 0)
 
 
 if __name__ == "__main__":

@@ -38,8 +38,8 @@ async def game_info(contest: str):
 
 @tool(read_only=False)
 async def prepare_level(contest: str, level: int):
-    """Get fresh progress, exact inputFiles IDs, level ZIP and extracted file artifact IDs in one call.
-    Then render PDF artifacts or read/download inputs. Does not start training or submit anything."""
+    """Get fresh progress, exact inputFiles IDs, level ZIP and statement artifacts in one call.
+    Small archives are extracted; large inputs stay in the ZIP for local download. Does not start or submit."""
 
     async def run():
         service = current_service()
@@ -64,6 +64,7 @@ async def prepare_level(contest: str, level: int):
                 "upload_url": service.artifacts.transfer_url,
                 "auth_header": "X-CCC-Session",
                 "max_file_bytes": service.client.settings.max_bytes,
+                "retention_seconds": service.client.settings.artifact_ttl_seconds,
                 "download": 'curl --fail --output input.zip --header "X-CCC-Session: $CCC_SESSION" DOWNLOAD_URL',
                 "upload": 'curl --fail --header "X-CCC-Session: $CCC_SESSION" --header "Content-Type: application/octet-stream" --data-binary @answer.out UPLOAD_URL',
             },
@@ -175,9 +176,9 @@ async def render_pdf_page(
                 lambda: current_service().artifacts.pdf_image(artifact_id, p, dpi)
             )
             size += len(data)
-            if size > current_service().client.settings.max_bytes:
+            if size > min(current_service().client.settings.max_bytes, 8 * 1024 * 1024):
                 raise ValueError(
-                    "Images exceed CCC_MAX_FILE_BYTES; request fewer pages or lower dpi"
+                    "Images exceed response budget; request fewer pages or lower dpi"
                 )
             metadata.append(info)
             images.append(
@@ -238,9 +239,7 @@ async def submit_solution(
         payload = (
             solution.encode("utf-8")
             if solution is not None
-            else await local(
-                lambda: current_service().artifacts.path(artifact_id).read_bytes()
-            )
+            else current_service().artifacts.path(artifact_id)
         )
         feedback = await current_service().submit(
             contest, level, file_id, payload, filename
@@ -318,10 +317,24 @@ async def ccc_api_request(
         ):
             raise ValueError("Raw authentication endpoints are disabled")
         response = await current_service().client.request(
-            method, path, params=_params(query), json_body=body
+            method,
+            path,
+            params=_params(query),
+            json_body=body,
+            download=(
+                lambda chunks: current_service().artifacts.receive(chunks, filename)
+            )
+            if response_format == "file"
+            else None,
         )
         if response_format == "file":
-            return current_service().artifacts.save(response.content, filename)
+            return (
+                response
+                if isinstance(response, dict)
+                else await local(
+                    lambda: current_service().artifacts.save(response.content, filename)
+                )
+            )
         return response.json() if response.content else None
 
     return await _call(run)
@@ -343,10 +356,25 @@ async def game_api_request(
         if method != "GET" and not current_service().client.settings.enable_raw_writes:
             raise ValueError("Set CCC_ENABLE_RAW_WRITES=1 for generic mutations")
         response = await current_service().request(
-            contest, method, path, params=_params(query), json_body=body
+            contest,
+            method,
+            path,
+            params=_params(query),
+            json_body=body,
+            download=(
+                lambda chunks: current_service().artifacts.receive(chunks, filename)
+            )
+            if response_format == "file"
+            else None,
         )
         if response_format == "file":
-            return current_service().artifacts.save(response.content, filename)
+            return (
+                response
+                if isinstance(response, dict)
+                else await local(
+                    lambda: current_service().artifacts.save(response.content, filename)
+                )
+            )
         return response.json() if response.content else None
 
     return await _call(run)

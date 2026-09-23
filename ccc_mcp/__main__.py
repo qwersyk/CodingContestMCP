@@ -78,7 +78,7 @@ async def download_http(http, url, artifact, path, limit):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", required=True, help="MCP endpoint URL")
-    parser.add_argument("--max-bytes", type=int, default=64 * 1024 * 1024)
+    parser.add_argument("--max-bytes", type=int, default=256 * 1024 * 1024)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser(
         "upload", help="Upload a local file; print its artifact_id"

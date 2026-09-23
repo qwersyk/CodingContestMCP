@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -14,6 +15,19 @@ from ccc_mcp.config import Settings
 
 
 class HTTPTests(unittest.TestCase):
+    def test_cleanup_starts_with_server_lifespan(self):
+        cleaned = threading.Event()
+        with (
+            tempfile.TemporaryDirectory() as root,
+            patch(
+                "ccc_mcp.app.StorageBudget.cleanup",
+                side_effect=lambda *args: cleaned.set(),
+            ) as cleanup,
+        ):
+            with TestClient(create_app(Settings(data_dir=Path(root)))):
+                self.assertTrue(cleaned.wait(2))
+            cleanup.assert_called_once_with(21600)
+
     def test_multiple_accounts_and_artifact_isolation(self):
         clients = []
         sessions = {"a" * 32: "user-a", "b" * 32: "user-b", "c" * 32: "user-a"}

@@ -15,6 +15,67 @@ from ccc_mcp.service import Service
 
 
 class WorkflowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_large_download_and_submission_use_file_streams(self):
+        class LargeFile(httpx.AsyncByteStream):
+            closed = False
+
+            async def __aiter__(self):
+                for _ in range(804):
+                    yield b"x" * 262144
+
+            async def aclose(self):
+                self.closed = True
+
+        stream = LargeFile()
+
+        def handler(request):
+            if request.url.path == "/api/contests/test":
+                return httpx.Response(
+                    200,
+                    json={
+                        "slug": "test",
+                        "gameBaseUrl": "https://birds.codingcontest.org",
+                    },
+                )
+            if request.url.path == "/api/game-token":
+                return httpx.Response(200, json={"token": "token"})
+            return httpx.Response(
+                200, stream=stream, headers={"content-type": "application/zip"}
+            )
+
+        with tempfile.TemporaryDirectory() as root:
+            client = CCCClient(
+                Settings(data_dir=Path(root), cookie="XSRF-TOKEN=csrf"),
+                httpx.MockTransport(handler),
+            )
+            service = Service(client)
+            try:
+                artifact = await service.asset(
+                    "test", "/api/contestant/level/1/files", "large.zip"
+                )
+                self.assertEqual(artifact["bytes"], 201 * 1024 * 1024)
+                self.assertTrue(stream.closed)
+                path = service.artifacts.path(artifact["artifact_id"])
+                self.assertEqual(path.stat().st_size, artifact["bytes"])
+                opened = []
+
+                async def submitted(*args, **kwargs):
+                    file = kwargs["files"]["solution"][1]
+                    opened.append(file)
+                    self.assertFalse(file.closed)
+                    self.assertEqual(file.read(10), b"x" * 10)
+                    return httpx.Response(200, json={"evaluation": {"isCorrect": True}})
+
+                with patch.object(
+                    client, "request", new=AsyncMock(side_effect=submitted)
+                ):
+                    feedback = await service.submit("test", 1, "1", path, "answer.out")
+                self.assertTrue(feedback["evaluation"]["isCorrect"])
+                self.assertEqual(len(opened), 1)
+                self.assertTrue(opened[0].closed)
+            finally:
+                await client.close()
+
     async def test_large_failed_cases_have_bounded_previews_and_full_artifact(self):
         with tempfile.TemporaryDirectory() as root:
             client = CCCClient(
