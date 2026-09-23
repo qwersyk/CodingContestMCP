@@ -46,6 +46,14 @@ def segment(value):
     return quote(value, safe="")
 
 
+def compact_progress(value):
+    if isinstance(value, dict):
+        return {k: compact_progress(v) for k, v in value.items() if k != "submissions"}
+    if isinstance(value, list):
+        return [compact_progress(v) for v in value]
+    return value
+
+
 @dataclass
 class Game:
     slug: str
@@ -86,7 +94,10 @@ class Service:
             f"/api/training/{segment(game['slug'])}/start",
             params={"mode": mode},
         )
-        return {"training": result, "next": "Call start_game with training.contestName"}
+        return {
+            "training": result,
+            "next": "Call prepare_level with training.contestName and level=1",
+        }
 
     async def session(self, contest: str, rejected: Game | None = None):
         contest = contest_slug(contest)
@@ -185,9 +196,13 @@ class Service:
         ]
         return dict(
             contest_slug=game.slug,
-            game=metadata,
+            game={
+                k: v
+                for k, v in metadata.items()
+                if k not in ("levelsInfo", "versions", "dev")
+            },
             levels=levels,
-            participant=progress,
+            participant=compact_progress(progress),
             access_note="Level accessibility is a progress hint only; CCC decides access on download/submission",
             resume={
                 "contest": game.slug,

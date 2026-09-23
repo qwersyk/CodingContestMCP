@@ -8,7 +8,7 @@ from urllib.parse import unquote
 from mcp.types import ImageContent
 
 from .context import current_service
-from .service import segment
+from .service import compact_progress, segment
 from .tools import _call, _params, local, result, tool
 
 
@@ -29,18 +29,40 @@ async def active_training():
     )
 
 
-@tool(read_only=False)
-async def start_game(contest: str):
-    """Open/resume an existing training or competition by slug or CCC contest/game URL.
-    No training mode is needed. Does not create a new training. Share resume.contest with another agent."""
-    return await _call(lambda: current_service().info(contest))
-
-
 @tool(read_only=True)
 async def game_info(contest: str):
     """Get fresh progress, game metadata, inputFiles IDs and a resume reference.
     Accessible levels are hints derived from progress; CCC decides actual access."""
     return await _call(lambda: current_service().info(contest))
+
+
+@tool(read_only=False)
+async def prepare_level(contest: str, level: int):
+    """Get fresh progress, exact inputFiles IDs, level ZIP and extracted file artifact IDs in one call.
+    Then render PDF artifacts or read/download inputs. Does not start training or submit anything."""
+
+    async def run():
+        service = current_service()
+        service.validate_level(level)
+        info = await service.info(contest)
+        archive = await service.asset(
+            info["contest_slug"],
+            f"/api/contestant/level/{level}/files",
+            f"level-{level}.zip",
+        )
+        files = await local(lambda: service.artifacts.unpack(archive["artifact_id"]))
+        return {
+            "contest": info["contest_slug"],
+            "level": level,
+            "level_info": next(
+                (entry for entry in info["levels"] if entry["level"] == level), None
+            ),
+            "participant": info["participant"],
+            "archive": archive,
+            "files": files,
+        }
+
+    return await _call(run)
 
 
 @tool(read_only=False)
@@ -163,15 +185,6 @@ async def upload_artifact(data_base64: str, filename: str = "solution.out"):
 
 
 @tool(read_only=False)
-async def import_solution(relative_path: str):
-    """Import a shared-volume file from this account's inbox. Paths are relative to inbox.
-    Returns artifact_id for submit_solution. Supports files up to CCC_MAX_FILE_BYTES."""
-    return await _call(
-        lambda: local(lambda: current_service().artifacts.import_file(relative_path))
-    )
-
-
-@tool(read_only=False)
 async def submit_solution(
     contest: str,
     level: int,
@@ -243,54 +256,7 @@ async def submit_solution(
                 failed_cases=previews,
             )
             feedback["full_result"] = full
-        return feedback
-
-    return await _call(run)
-
-
-@tool(read_only=True)
-async def participant_state(contest: str):
-    """Read game-engine participant state."""
-
-    async def run():
-        return (
-            await current_service().request(
-                contest, "GET", "/api/game-engine/participant/state"
-            )
-        ).json()
-
-    return await _call(run)
-
-
-@tool(read_only=True)
-async def game_leaderboard(
-    contest: str, scope: Literal["WORLD", "COUNTRY", "LOCATION"] = "WORLD"
-):
-    """Read leaderboard using the actual website scopes."""
-
-    async def run():
-        return (
-            await current_service().request(
-                contest, "GET", "/api/game-engine/leaderboard", params={"scope": scope}
-            )
-        ).json()
-
-    return await _call(run)
-
-
-@tool(read_only=False)
-async def download_certificate(contest_id: int, certificate_type: str):
-    """Download a certificate listed by my_certificates as a PDF artifact."""
-
-    async def run():
-        response = await current_service().client.request(
-            "GET", f"/api/certificates/{contest_id}/{segment(certificate_type)}"
-        )
-        return await local(
-            lambda: current_service().artifacts.save(
-                response.content, f"{contest_id}-{certificate_type}.pdf"
-            )
-        )
+        return feedback if include_case_details else compact_progress(feedback)
 
     return await _call(run)
 
@@ -318,7 +284,7 @@ async def ccc_api_request(
             and decoded.split("?")[0] != "/api/auth/current-user"
         ):
             raise ValueError(
-                "Use dedicated account tools; raw authentication endpoints are disabled"
+                "Raw authentication endpoints are disabled"
             )
         response = await current_service().client.request(
             method, path, params=_params(query), json_body=body
