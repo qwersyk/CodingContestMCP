@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import io
+import json
 import unittest
 import zipfile
 from contextlib import asynccontextmanager
@@ -11,22 +12,6 @@ from ccc_mcp.app import create_app
 from ccc_mcp.client import CCCClient
 from ccc_mcp.config import Settings
 
-METADATA = {
-    "name": "Test",
-    "levelsInfo": {
-        "count": 1,
-        "levels": [
-            {
-                "inputFiles": ["0-example", "1-small", "2-large"],
-                "unscoredFiles": ["0-example"],
-            }
-        ],
-    },
-}
-PROGRESS = {
-    "score": {"gameScore": {"level": 1}, "state": {"level1": {"submissions": []}}}
-}
-
 
 def token_for(session):
     return "game-" + hashlib.sha256(session.encode()).hexdigest()
@@ -34,8 +19,6 @@ def token_for(session):
 
 def discovery_response(request, session):
     path = request.url.path
-    if path == "/api/auth/current-user":
-        return httpx.Response(200, json={"uuid": "user-" + session})
     if path.startswith("/api/contests/"):
         slug = path.rsplit("/", 1)[-1].replace(".", "-")
         return httpx.Response(
@@ -47,10 +30,6 @@ def discovery_response(request, session):
         )
     if path == "/api/game-token":
         return httpx.Response(200, json={"token": token_for(session)})
-    if path == "/game/game-info":
-        return httpx.Response(200, json=METADATA)
-    if path == "/api/contestant/contestant-info":
-        return httpx.Response(200, json=PROGRESS)
     raise AssertionError(f"Unexpected discovery request: {path}")
 
 
@@ -58,13 +37,13 @@ def discovery_response(request, session):
 async def harness(handler=discovery_response):
     created, seen = [], []
 
-    def factory(settings, session):
+    def factory(session):
         async def handle(request):
             seen.append(request)
             value = handler(request, session)
             return await value if hasattr(value, "__await__") else value
 
-        client = CCCClient(settings, session, httpx.MockTransport(handle))
+        client = CCCClient(session, httpx.MockTransport(handle))
         created.append(client)
         return client
 
@@ -76,6 +55,10 @@ async def harness(handler=discovery_response):
         ) as http,
     ):
         yield http, created, seen
+
+
+def data_of(result):
+    return json.loads(result["content"][0]["text"])
 
 
 async def rpc(http, method, params=None, headers=None):
@@ -122,6 +105,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
             instructions = initialized.json()["result"]["instructions"]
             self.assertIn("multipart/form-data", instructions)
             self.assertIn("connect_contest", instructions)
+            self.assertIn("progress.cooldowns", instructions)
             listed = await rpc(http, "tools/list")
             tools = listed.json()["result"]["tools"]
             self.assertEqual([t["name"] for t in tools], ["connect_contest"])
@@ -130,26 +114,20 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(created, [])
             self.assertEqual(seen, [])
 
-    async def test_connection_returns_raw_state_and_direct_http_routes(self):
+    async def test_connection_returns_only_direct_http_routes(self):
         async with harness() as (http, clients, seen):
             result = await connect(http)
             self.assertFalse(result["isError"])
-            data = result["structuredContent"]
-            self.assertEqual(data["contest"], "training-test-01")
-            self.assertEqual(data["game"], METADATA)
-            self.assertEqual(data["participant"], PROGRESS)
-            self.assertEqual(
-                data["connection"]["headers"]["Authorization"], token_for("a" * 32)
-            )
-            self.assertEqual(data["http"]["multipart_field"], "solution")
+            data = data_of(result)
+            self.assertEqual(data["headers"]["Authorization"], token_for("a" * 32))
+            self.assertEqual(set(data), {"base_url", "headers", "paths"})
+            self.assertNotIn("structuredContent", result)
             self.assertTrue(
-                data["http"]["level_files"].endswith("/level/{level}/files?raw=true")
+                data["paths"]["files"].endswith("/level/{level}/files?raw=true")
             )
             self.assertNotIn("a" * 32, str(data))
-            self.assertEqual(len(seen), 5)
-            self.assertTrue(
-                all(c.platform.is_closed and c.games.is_closed for c in clients)
-            )
+            self.assertEqual(len(seen), 3)
+            self.assertTrue(all(c.platform.is_closed for c in clients))
             self.assertEqual((await http.get("/mcp/artifacts")).status_code, 404)
 
     async def test_missing_invalid_and_duplicate_credentials_are_rejected(self):
@@ -167,7 +145,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 )
                 result = response.json()["result"]
                 self.assertTrue(result["isError"])
-                self.assertEqual(result["structuredContent"]["error"]["status"], 401)
+                self.assertEqual(data_of(result)["status"], 401)
             self.assertEqual(clients, [])
             self.assertEqual(seen, [])
 
@@ -180,7 +158,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         async with harness(handle) as (http, clients, seen):
             result = await connect(http)
             self.assertTrue(result["isError"])
-            self.assertEqual(result["structuredContent"]["error"]["status"], 401)
+            self.assertEqual(data_of(result)["status"], 401)
             self.assertEqual(len(seen), 3)
             self.assertTrue(all(r.url.host == "codingcontest.org" for r in seen))
             self.assertTrue(clients[0].platform.is_closed)
@@ -216,8 +194,8 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         async with harness(handle) as (http, _, _seen):
             first = await connect(http)
             self.assertEqual(
-                first["structuredContent"]["error"],
-                {"status": 429, "detail": detail, "retry_after": "120"},
+                data_of(first),
+                {"status": 429, "error": detail, "retry_after": "120"},
             )
             self.assertTrue(first["isError"])
             second = await connect(http)
@@ -245,32 +223,26 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 *(connect(http, session=s) for s in sessions)
             )
             self.assertEqual(
-                [
-                    r["structuredContent"]["connection"]["headers"]["Authorization"]
-                    for r in results
-                ],
+                [data_of(r)["headers"]["Authorization"] for r in results],
                 [token_for(s) for s in sessions],
             )
             self.assertTrue(all(not r["isError"] for r in results))
-            self.assertTrue(
-                all(c.platform.is_closed and c.games.is_closed for c in clients)
-            )
+            self.assertTrue(all(c.platform.is_closed for c in clients))
 
-    async def test_large_metadata_and_progress_are_not_trimmed(self):
-        metadata = {**METADATA, "description": "large" * 10000}
-        progress = {"score": {"submissions": list(range(2000))}}
-
+    async def test_large_discovery_metadata_is_not_returned(self):
         def handle(request, session):
-            if request.url.path == "/game/game-info":
-                return httpx.Response(200, json=metadata)
-            if request.url.path == "/api/contestant/contestant-info":
-                return httpx.Response(200, json=progress)
-            return discovery_response(request, session)
+            response = discovery_response(request, session)
+            if request.url.path.startswith("/api/contests/"):
+                return httpx.Response(
+                    200, json={**response.json(), "description": "x" * 100000}
+                )
+            return response
 
-        async with harness(handle) as (http, _, _):
-            result = (await connect(http))["structuredContent"]
-            self.assertEqual(result["game"], metadata)
-            self.assertEqual(result["participant"], progress)
+        async with harness(handle) as (http, _, seen):
+            result = await connect(http)
+            self.assertLess(len(json.dumps(result)), 1000)
+            self.assertNotIn("structuredContent", result)
+            self.assertTrue(all(r.url.host == "codingcontest.org" for r in seen))
 
     async def test_expired_token_is_refreshed_by_new_connection(self):
         count = 0
@@ -280,18 +252,14 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
             if request.url.path == "/api/game-token":
                 count += 1
                 return httpx.Response(200, json={"token": str(count)})
-            if request.url.path == "/game/game-info" and count == 1:
-                return httpx.Response(401, json={"error": "expired"})
             return discovery_response(request, session)
 
         async with harness(handle) as (http, _, _):
-            self.assertTrue((await connect(http))["isError"])
+            self.assertFalse((await connect(http))["isError"])
             refreshed = await connect(http)
             self.assertFalse(refreshed["isError"])
             self.assertEqual(
-                refreshed["structuredContent"]["connection"]["headers"][
-                    "Authorization"
-                ],
+                data_of(refreshed)["headers"]["Authorization"],
                 "2",
             )
             self.assertEqual(count, 2)
@@ -323,7 +291,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         uploads = []
 
         async with harness() as (http, _clients, seen):
-            connection = (await connect(http))["structuredContent"]
+            connection = data_of(await connect(http))
             discovery_count = len(seen)
 
             async def direct(request):
@@ -350,10 +318,11 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
 
             async with httpx.AsyncClient(
                 transport=httpx.MockTransport(direct),
-                headers=connection["connection"]["headers"],
+                headers=connection["headers"],
+                base_url=connection["base_url"],
             ) as game:
                 zip_response = await game.get(
-                    connection["http"]["level_files"].format(level=1)
+                    connection["paths"]["files"].format(level=1)
                 )
                 with zipfile.ZipFile(io.BytesIO(zip_response.content)) as z:
                     self.assertEqual(z.read("input.txt"), b"42\n")
@@ -361,7 +330,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 results = await asyncio.gather(
                     *(
                         game.post(
-                            connection["http"]["submit"].format(
+                            connection["paths"]["submit"].format(
                                 level=1, file_id=file_id
                             ),
                             files={

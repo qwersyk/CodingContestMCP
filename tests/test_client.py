@@ -24,26 +24,16 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
                 200, json={}, headers={"set-cookie": "unwanted=secret; Path=/"}
             )
 
-        client = CCCClient(Settings(), "session-secret", httpx.MockTransport(handle))
+        client = CCCClient("session-secret", httpx.MockTransport(handle))
         try:
             await client.json("POST", "/api/game-token", {"contestSlug": "test"})
             self.assertEqual(len(seen), 2)
             self.assertEqual(seen[1].headers["x-xsrf-token"], "csrf token")
             self.assertIn("SESSION=session-secret", seen[1].headers["cookie"])
-            for _ in range(2):
-                await client.game_json(
-                    "https://birds.codingcontest.org/",
-                    "/api/state",
-                    {"Authorization": "game-token", "X-CCC-SLUG": "test"},
-                )
-                self.assertNotIn("cookie", seen[-1].headers)
-                self.assertNotIn("x-xsrf-token", seen[-1].headers)
-                self.assertEqual(seen[-1].headers["authorization"], "game-token")
             self.assertTrue(all("authorization" not in r.headers for r in seen[:2]))
         finally:
             await client.close()
         self.assertTrue(client.platform.is_closed)
-        self.assertTrue(client.games.is_closed)
 
     async def test_upstream_errors_are_not_retried_or_rewritten(self):
         seen = []
@@ -53,7 +43,7 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
             seen.append(request)
             return httpx.Response(429, json=detail, headers={"retry-after": "120"})
 
-        client = CCCClient(Settings(), "session", httpx.MockTransport(handle))
+        client = CCCClient("session", httpx.MockTransport(handle))
         client.platform.cookies.set("XSRF-TOKEN", "csrf", domain="codingcontest.org")
         try:
             for _ in range(2):
@@ -77,7 +67,7 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
                 headers={"location": "https://other.example"},
             )
 
-        client = CCCClient(Settings(), "session", httpx.MockTransport(handle))
+        client = CCCClient("session", httpx.MockTransport(handle))
         try:
             with self.assertRaises(APIError) as caught:
                 await client.json("GET", "/api/contests/test")
@@ -86,7 +76,7 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.close()
 
-    async def test_game_state_reads_overlap(self):
+    async def test_platform_requests_overlap(self):
         arrived = 0
         both = asyncio.Event()
 
@@ -98,21 +88,15 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(both.wait(), 2)
             return httpx.Response(200, json={"path": request.url.path})
 
-        client = CCCClient(Settings(), "session", httpx.MockTransport(handle))
+        client = CCCClient("session", httpx.MockTransport(handle))
         try:
             responses = await asyncio.gather(
-                client.game_json(
-                    "https://birds.codingcontest.org", "/game/game-info", {}
-                ),
-                client.game_json(
-                    "https://birds.codingcontest.org",
-                    "/api/contestant/contestant-info",
-                    {},
-                ),
+                client.json("GET", "/api/contests/one"),
+                client.json("GET", "/api/contests/two"),
             )
             self.assertEqual(
                 [r["path"] for r in responses],
-                ["/game/game-info", "/api/contestant/contestant-info"],
+                ["/api/contests/one", "/api/contests/two"],
             )
             self.assertIsNone(client.platform.timeout.read)
         finally:
@@ -177,7 +161,7 @@ class ConfigurationTests(unittest.TestCase):
             },
         ):
             settings = Settings.from_env()
-        self.assertIsNone(settings.timeout)
+        self.assertFalse(hasattr(settings, "timeout"))
         self.assertFalse(hasattr(settings, "session"))
         self.assertFalse(hasattr(settings, "cookie"))
         self.assertFalse(hasattr(settings, "max_bytes"))
@@ -185,7 +169,6 @@ class ConfigurationTests(unittest.TestCase):
     def test_invalid_settings(self):
         for values in (
             {"port": 0},
-            {"timeout": 0},
             {"public_origin": "https://host/path"},
         ):
             with self.subTest(values=values), self.assertRaises(ValueError):

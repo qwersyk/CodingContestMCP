@@ -1,6 +1,5 @@
 """CCC authentication and JSON discovery; file traffic goes directly to CCC."""
 
-import asyncio
 import re
 from urllib.parse import quote, unquote, urlsplit
 
@@ -69,22 +68,21 @@ def json_response(response):
 
 
 class CCCClient:
-    def __init__(self, settings, session, transport=None):
-        options = {
-            "timeout": settings.timeout,
-            "follow_redirects": False,
-            "transport": transport,
-            "limits": httpx.Limits(max_connections=None, max_keepalive_connections=20),
-            "headers": {"User-Agent": "codingcontest-mcp/3.0"},
-        }
-        self.platform = httpx.AsyncClient(base_url=PLATFORM, **options)
+    def __init__(self, session, transport=None):
+        self.platform = httpx.AsyncClient(
+            base_url=PLATFORM,
+            timeout=None,
+            follow_redirects=False,
+            transport=transport,
+            limits=httpx.Limits(max_connections=None),
+            headers={"User-Agent": "codingcontest-mcp/3.0"},
+        )
         self.platform.cookies.set(
             "SESSION", session, domain="codingcontest.org", path="/"
         )
-        self.games = httpx.AsyncClient(**options)
 
     async def close(self):
-        await asyncio.gather(self.platform.aclose(), self.games.aclose())
+        await self.platform.aclose()
 
     def csrf(self):
         return next(
@@ -106,11 +104,3 @@ class CCCClient:
         return json_response(
             await self.platform.request(method, path, json=body, headers=headers)
         )
-
-    async def game_json(self, origin, path, headers):
-        request = self.games.build_request(
-            "GET", game_origin(origin) + path, headers=headers
-        )
-        # Game requests never carry platform cookies, including cookies set by a game.
-        request.headers.pop("cookie", None)
-        return json_response(await self.games.send(request))
