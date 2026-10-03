@@ -12,20 +12,22 @@ from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from .client import APIError, CCCClient, contest_slug, game_origin
 
 INSTRUCTIONS = (
-    "The user starts a contest and supplies its game URL. Call connect_contest to get "
-    "base_url, headers and relative paths for direct HTTPS requests to CCC. "
-    "Fetch info/progress yourself; filter HTTP output locally to needed fields. "
-    "GET files (replace {level}) downloads a ZIP; "
-    "extract it, read the PDF and solve locally. Exact inputFiles IDs are in "
-    "info.levelsInfo.levels[level-1]; unscoredFiles are examples. "
-    "POST each output to submit (replace {level}/{file_id}) as multipart/form-data field solution. "
-    "Check evaluation.isCorrect and progress. Direct requests may run concurrently. "
-    "CCC owns access, rate limits, Retry-After and cooldownSec. "
-    "Cooldowns may be per level/file; inspect progress.cooldowns rather than imposing a global delay. "
-    "On 401 reconnect; "
-    "after an uncertain upload inspect progress before retrying. "
-    "Headers contain a private game token: send them only to base_url, never to other hosts. "
-    "This MCP neither starts training nor stores/transfers files."
+    "The user starts the contest. Call connect_contest with its game URL/slug. "
+    "Use your computer's HTTPS client with returned base_url, headers and paths. "
+    "Keep the token private; send headers only to base_url. "
+    "GET info/progress: levelsInfo.levels[level-1] gives exact inputFiles IDs and "
+    "unscoredFiles (examples); score.gameScore.level is current. "
+    "GET files for {level} downloads a ZIP. Extract, read its PDF, compute outputs locally. "
+    "Test examples locally. POST submit for {level}/{file_id} as multipart/form-data field solution. "
+    "Parallelize reads/computation; await each submission per contest: CCC can overwrite "
+    "progress on concurrent writes. Check evaluation.isCorrect, then saved progress after the batch; "
+    "passedFiles entries count only when non-null. "
+    "Submission cooldowns may be per file, not global; progress.cooldowns lists "
+    "level/fileId/remainingMs. Respect CCC's Retry-After/cooldownSec for that file; "
+    "other files can proceed immediately. "
+    "On 401 reconnect. After an uncertain upload inspect progress before retrying. "
+    "Store large HTTP responses locally; show only needed fields. "
+    "This MCP only connects; it never starts training or stores/transfers files."
 )
 
 
@@ -79,10 +81,9 @@ def create_mcp(settings, client_factory=CCCClient):
         structured_output=False,
     )
     async def connect_contest(contest: str, ctx: Context) -> CallToolResult:
-        """Get direct HTTP connection for a user-started contest URL or slug.
-        Requires X-CCC-Session in the MCP connection. Returns base_url, private headers and paths.
-        Fetch info/progress and level ZIPs directly; POST outputs as multipart/form-data field solution.
-        Replace {level}/{file_id} in paths. Call again after a game-token 401. No files pass through MCP."""
+        """Get CCC base_url, private headers and paths for a started contest URL/slug.
+        Requires X-CCC-Session MCP header. Use direct HTTPS from your computer.
+        Reconnect on HTTP 401. No files pass through MCP."""
         client = None
         try:
             slug = contest_slug(contest)

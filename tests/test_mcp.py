@@ -106,6 +106,8 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("multipart/form-data", instructions)
             self.assertIn("connect_contest", instructions)
             self.assertIn("progress.cooldowns", instructions)
+            self.assertIn("await each submission", instructions)
+            self.assertIn("non-null", instructions)
             listed = await rpc(http, "tools/list")
             tools = listed.json()["result"]["tools"]
             self.assertEqual([t["name"] for t in tools], ["connect_contest"])
