@@ -102,14 +102,15 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 {"Accept": "application/json, text/event-stream"},
             )
             self.assertEqual(initialized.status_code, 200, initialized.text)
-            instructions = initialized.json()["result"]["instructions"]
-            self.assertIn("multipart/form-data", instructions)
-            self.assertIn("connect_contest", instructions)
-            self.assertIn("progress.cooldowns", instructions)
-            self.assertIn("await each submission", instructions)
-            self.assertIn("non-null", instructions)
+            self.assertNotIn("instructions", initialized.json()["result"])
             listed = await rpc(http, "tools/list")
             tools = listed.json()["result"]["tools"]
+            instructions = tools[0]["description"]
+            self.assertIn("multipart/form-data", instructions)
+            self.assertIn("X-CCC-Session", instructions)
+            self.assertIn("progress.cooldowns", instructions)
+            self.assertIn("concurrent writes can overwrite progress", instructions)
+            self.assertIn("non-null", instructions)
             self.assertEqual([t["name"] for t in tools], ["connect_contest"])
             self.assertEqual(tools[0]["inputSchema"]["required"], ["contest"])
             self.assertNotIn("ctx", tools[0]["inputSchema"]["properties"])
@@ -122,6 +123,8 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(result["isError"])
             data = data_of(result)
             self.assertEqual(data["headers"]["Authorization"], token_for("a" * 32))
+            self.assertEqual(data["headers"]["Referer"], "https://codingcontest.org/")
+            self.assertEqual(data["headers"]["X-CCC-SLUG"], "training-test-01")
             self.assertEqual(set(data), {"base_url", "headers", "paths"})
             self.assertNotIn("structuredContent", result)
             self.assertTrue(
