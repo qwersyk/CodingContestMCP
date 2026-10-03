@@ -1,85 +1,35 @@
-"""MCP tools operating on the authenticated request account."""
-
-from __future__ import annotations
+"""One connection tool; the agent handles downloads, solving and submissions."""
 
 import asyncio
 import json
-from typing import Any
-from urllib.parse import urlsplit
+import re
+from urllib.parse import quote, urlsplit
 
 import httpx
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
 
-from .client import APIError
-from .config import Settings
-from .context import current_service
-from .service import segment
+from .client import APIError, CCCClient, contest_slug, game_origin
 
-settings = Settings.from_env()
-
-_registered_tools = []
-
-
-def create_mcp(configured: Settings):
-    mcp = FastMCP(
-        "codingcontest",
-        host=configured.host,
-        port=configured.port,
-        stateless_http=True,
-        json_response=True,
-        instructions="list_challenges -> start_training -> prepare_level(contest, level). "
-        "For existing games use active_training or a contest slug/URL directly; no start call is needed. "
-        "prepare_level returns a ZIP download URL, exact inputFiles IDs and an upload URL. "
-        "Transfer ALL files by HTTP using the returned URLs as-is; no cookies or auth headers are needed. "
-        "URLs are temporary bearer secrets: do not share them; request fresh links after expiry or server restart. "
-        "Download and extract the ZIP, view PDFs and run solutions locally. "
-        "POST each output file to upload_url, then submit_solution with its artifact_id. "
-        "Check evaluation.isCorrect and cooldownSec. On 429 wait retry_after. "
-        "Never blindly repeat uncertain submissions; check game_info first. "
-        "Oversized responses provide full_result.download_url for local inspection. "
-        "Never put file contents in tool arguments.",
-        transport_security=TransportSecuritySettings(
-            enable_dns_rebinding_protection=True,
-            allowed_hosts=[
-                "localhost",
-                "127.0.0.1",
-                "[::1]",
-                "127.0.0.1:*",
-                "localhost:*",
-                "[::1]:*",
-                urlsplit(configured.public_origin).netloc,
-            ],
-            allowed_origins=[
-                "http://127.0.0.1:*",
-                "http://localhost:*",
-                configured.public_origin,
-            ],
-        ),
-    )
-    for fn, hints in _registered_tools:
-        mcp.tool(annotations=hints, structured_output=False)(fn)
-    return mcp
-
-
-def tool(read_only=None):
-    def register(fn):
-        read = (
-            read_only
-            if read_only is not None
-            else fn.__name__.startswith(("get_", "list_", "my_", "auth_", "active_"))
-        )
-        annotations = ToolAnnotations(
-            readOnlyHint=read,
-            destructiveHint=not read,
-            idempotentHint=read,
-            openWorldHint=True,
-        )
-        _registered_tools.append((fn, annotations))
-        return fn
-
-    return register
+INSTRUCTIONS = (
+    "The user starts the contest on codingcontest.org and gives you its game URL. "
+    "Call connect_contest once with that URL. It returns metadata, current progress and "
+    "connection.base_url/headers for direct HTTPS requests to CCC. It does not start a timer. "
+    "Download a level ZIP using http.level_files (replace {level}) and the returned headers. "
+    "Extract it locally, read the PDF, and solve every scored inputFiles ID from "
+    "game.levelsInfo.levels[level-1]; unscoredFiles are examples. "
+    "Upload each local output DIRECTLY to http.submit (replace {level} and {file_id}), "
+    "using multipart/form-data with field name solution. Do not upload files to this MCP server. "
+    "Use evaluation.isCorrect and the progress endpoint to decide the next step. "
+    "Requests and uploads may run concurrently; CCC owns access, cooldowns and rate limits. "
+    "No local delays, file-size limits, response truncation or submission retries are added. "
+    "Inspect CCC's Retry-After and cooldownSec yourself. On an expired token/401, "
+    "call connect_contest again; on an uncertain upload outcome inspect progress before retrying. "
+    "Send connection.headers only to the exact returned game origin, never to other hosts or "
+    "signed external download URLs. The returned game token is a private credential; "
+    "keep it out of shared files and messages. The platform SESSION stays in the MCP connection header."
+)
 
 
 def result(data, error=False):
@@ -90,165 +40,140 @@ def result(data, error=False):
     )
 
 
-def _params(values):
-    return {k: v for k, v in (values or {}).items() if v is not None}
+def create_mcp(settings, client_factory=CCCClient):
+    origin = urlsplit(settings.public_origin)
+    mcp = FastMCP(
+        "codingcontest",
+        host=settings.host,
+        port=settings.port,
+        stateless_http=True,
+        json_response=True,
+        instructions=INSTRUCTIONS,
+        transport_security=TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=[
+                "localhost",
+                "127.0.0.1",
+                "[::1]",
+                "localhost:*",
+                "127.0.0.1:*",
+                "[::1]:*",
+                origin.netloc,
+            ],
+            allowed_origins=[
+                "http://localhost:*",
+                "http://127.0.0.1:*",
+                settings.public_origin,
+            ],
+        ),
+    )
 
-
-async def _call(fn):
-    try:
-        data = await fn()
-        return (
-            data
-            if isinstance(data, CallToolResult)
-            else result({"ok": True, "data": await bounded(data)})
-        )
-    except APIError as error:
-        hint = {
-            401: "Update the X-CCC-Session header in your MCP connection.",
-            403: "Check participant role, registration, contest state and CSRF.",
-            429: "Respect retry_after/cooldown before retrying.",
-            413: "Solution exceeds upstream file limit.",
-        }.get(error.status, "Inspect current contest state.")
-        return result(
-            {
-                "ok": False,
-                "error": {
-                    "status": error.status,
-                    "detail": str(error.detail)[:2000],
-                    "retry_after": error.retry_after,
-                    "hint": hint,
+    @mcp.tool(
+        annotations=ToolAnnotations(
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=False,
+            openWorldHint=True,
+        ),
+        structured_output=False,
+    )
+    async def connect_contest(contest: str, ctx: Context) -> CallToolResult:
+        """Connect to a contest already started by the user; accept its game URL or slug.
+        Returns game metadata/inputFiles, progress, and game-scoped headers for direct HTTP.
+        GET http.level_files with these headers to download the ZIP and solve it locally.
+        POST each output directly to http.submit as multipart field solution; check evaluation.isCorrect.
+        Replace {level}/{file_id} in the URLs. Parallel requests are allowed; CCC enforces its limits.
+        Refresh an expired game token by calling this tool again. Requires X-CCC-Session in the MCP connection.
+        No training is started and no files or CCC sessions are stored on this MCP server."""
+        client = None
+        try:
+            slug = contest_slug(contest)
+            request = ctx.request_context.request
+            sessions = request.headers.getlist("x-ccc-session") if request else []
+            if len(sessions) != 1 or not re.fullmatch(
+                r"[A-Za-z0-9_+/=%.-]+", sessions[0]
+            ):
+                raise APIError(
+                    401,
+                    "Supply the SESSION cookie value in the X-CCC-Session MCP connection header",
+                )
+            client = client_factory(settings, sessions[0])
+            data = await client.json("GET", f"/api/contests/{slug}")
+            base_url = game_origin(data["gameBaseUrl"])
+            # CCC authenticates the supplied session and checks contest access here.
+            token_data = await client.json(
+                "POST", "/api/game-token", {"contestSlug": data["slug"]}
+            )
+            token = token_data.get("token")
+            if not isinstance(token, str) or not token:
+                raise ValueError("CCC returned no game token")
+            headers = {
+                "Authorization": token,
+                "X-CCC-SLUG": data["slug"],
+                "Referer": "https://codingcontest.org/",
+            }
+            state = await asyncio.gather(
+                client.game_json(base_url, "/game/game-info", headers),
+                client.game_json(base_url, "/api/contestant/contestant-info", headers),
+                return_exceptions=True,
+            )
+            for value in state:
+                if isinstance(value, BaseException):
+                    raise value
+            metadata, progress = state
+            return result(
+                {
+                    "ok": True,
+                    "contest": data["slug"],
+                    "connection": {"base_url": base_url, "headers": headers},
+                    "game": metadata,
+                    "participant": progress,
+                    "http": {
+                        "metadata": base_url + "/game/game-info",
+                        "progress": base_url + "/api/contestant/contestant-info",
+                        "level_files": base_url
+                        + "/api/contestant/level/{level}/files?raw=true",
+                        "submit": base_url + "/api/contestant/submit-{level}-{file_id}",
+                        "multipart_field": "solution",
+                        "contest_page": "https://codingcontest.org/contests/"
+                        + quote(data["slug"], safe="")
+                        + "/game",
+                    },
+                }
+            )
+        except APIError as error:
+            return result(
+                {
+                    "ok": False,
+                    "error": {
+                        "status": error.status,
+                        "detail": error.detail,
+                        "retry_after": error.retry_after,
+                    },
                 },
-            },
-            True,
-        )
-    except httpx.RequestError:
-        return result(
-            {
-                "ok": False,
-                "error": {
-                    "type": "network_error",
-                    "hint": "Mutation outcome may be unknown. Inspect game_info before retrying.",
+                True,
+            )
+        except httpx.RequestError as error:
+            return result(
+                {
+                    "ok": False,
+                    "error": {
+                        "type": type(error).__name__,
+                        "detail": "CCC connection failed; retry connect_contest.",
+                    },
                 },
-            },
-            True,
-        )
-    except (ValueError, OSError, KeyError) as error:
-        return result(
-            {
-                "ok": False,
-                "error": {"type": type(error).__name__, "detail": str(error)[:2000]},
-            },
-            True,
-        )
-
-
-async def bounded(data):
-    encoded = json.dumps(data, ensure_ascii=False)
-    if len(encoded) <= 24000:
-        return data
-
-    def preview(value, depth=0):
-        if depth >= 8:
-            return "[truncated]"
-        if isinstance(value, dict):
-            return {k: preview(v, depth + 1) for k, v in list(value.items())[:40]}
-        if isinstance(value, list):
-            return [preview(v, depth + 1) for v in value[:20]]
-        return (
-            value[:1024] + "[truncated]"
-            if isinstance(value, str) and len(value) > 1024
-            else value
-        )
-
-    summary = preview(data)
-    if len(json.dumps(summary, ensure_ascii=False)) > 12000:
-        summary = encoded[:6000]
-    response = {"truncated": True, "preview": summary}
-    try:
-        response["full_result"] = await local(
-            lambda: current_service().artifacts.save(encoded.encode(), "response.json")
-        )
-    except (OSError, ValueError):
-        response["storage_warning"] = "Could not save the full response."
-    return response
-
-
-async def local(fn):
-    return await asyncio.to_thread(fn)
-
-
-@tool()
-async def auth_status() -> CallToolResult:
-    """Return the signed-in CCC user, or an authentication error if no session is configured."""
-
-    return await _call(
-        lambda: current_service().client.json("GET", "/api/auth/current-user")
-    )
-
-
-@tool()
-async def accept_participant_role() -> CallToolResult:
-    """Enable the Participant role required to start training and join contests."""
-
-    return await _call(
-        lambda: current_service().client.json(
-            "POST", "/api/auth/accept-participant-role", json_body=None
-        )
-    )
-
-
-@tool()
-async def list_challenges() -> CallToolResult:
-    """List all public training games. Each item includes its slug, name, description and level count."""
-
-    return await _call(lambda: current_service().client.json("GET", "/api/games"))
-
-
-@tool()
-async def list_contests(
-    page: int = 0,
-    size: int = 20,
-    statuses: list[str] | None = None,
-    search: str | None = None,
-) -> CallToolResult:
-    """Search contests and competitions. Statuses may include UPCOMING, OPEN_REGISTRATION, RUNNING, STATS_FROZEN and FINISHED."""
-
-    if page < 0 or size < 1 or size > 100:
-        return result(
-            {
-                "ok": False,
-                "error": {
-                    "type": "validation",
-                    "detail": "page >= 0 and 1 <= size <= 100 required",
+                True,
+            )
+        except (ValueError, KeyError, TypeError) as error:
+            return result(
+                {
+                    "ok": False,
+                    "error": {"type": type(error).__name__, "detail": str(error)},
                 },
-            },
-            True,
-        )
-    query: dict[str, Any] = {"page": page, "size": size, "search": search}
-    if statuses:
-        query["status"] = statuses
-    return await _call(
-        lambda: current_service().client.json(
-            "GET", "/api/contests", params=_params(query)
-        )
-    )
+                True,
+            )
+        finally:
+            if client is not None:
+                await client.close()
 
-
-@tool()
-async def get_contest(contest: str) -> CallToolResult:
-    """Get a contest by slug, including status, game URL, venues and team limits."""
-
-    return await _call(
-        lambda: current_service().client.json(
-            "GET", f"/api/contests/{segment(contest)}"
-        )
-    )
-
-
-@tool()
-async def my_registrations() -> CallToolResult:
-    """List the current user's contest registrations and team/venue choices."""
-
-    return await _call(
-        lambda: current_service().client.json("GET", "/api/contests/my-registrations")
-    )
+    return mcp
